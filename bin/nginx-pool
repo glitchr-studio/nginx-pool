@@ -370,9 +370,9 @@ remove_vhost() {
         local path=$(vhost_path "$user" "$domain")
         if [[ -d "$path" ]]; then
             if confirm "Remove domain '$domain' for user '$user'?"; then
-                mv "$path" "$path.disabled.$(date +%s)"
+                rm -rf "$path"
                 rm -f "$path.lock" || true
-                echo -e "${GREEN}[✓] Domain ${CYAN}$domain${GREEN} disabled (data preserved).${NC}"
+                echo -e "${GREEN}[✓] Domain ${CYAN}$domain${GREEN} deleted.${NC}"
             else
                 echo -e "${YELLOW}[i] Cancelled.${NC}"
             fi
