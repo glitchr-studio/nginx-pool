@@ -25,6 +25,7 @@
 # ==========================================================
 
 set -euo pipefail
+
 # ---------- Sudo context ----------
 if [[ -n "${SUDO_USER:-}" ]]; then
     RUN_AS="root (via sudo by $SUDO_USER)"
@@ -38,13 +39,19 @@ fi
 PORT=$(awk '/listen/ && /ssl/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) print $i}' /etc/nginx/conf.d/pool.conf)
 
 # Comma-separated list of pool domains
-# Example: MASTER="pool.glitchr.dev,localhost,backup.pool.glitchr.dev"
-MASTER="pool.glitchr.dev,localhost"
-
-# Convert to array
-IFS=',' read -r -a MASTER_DOMAINS <<< "$MASTER"
+MASTER="localhost"
+if [[ " ${*} " == *" --master "* ]]; then
+    # extract the next argument after --master
+    MASTER_OVERRIDE=$(echo " $* " | sed -n 's/.* --master \([^ ]*\).*/\1/p')
+    if [[ -n "$MASTER_OVERRIDE" ]]; then
+        MASTER="$MASTER_OVERRIDE"
+    fi
+    # strip out the --master argument pair so it doesn't confuse subcommands
+    set -- $(echo "$*" | sed "s/--master *$MASTER_OVERRIDE//")
+fi
 
 # Regex-safe version (for internal use)
+IFS=',' read -r -a MASTER_DOMAINS <<< "$MASTER"
 MASTER_REGEX=$(printf '%s\n' "${MASTER_DOMAINS[@]}" | sed 's/\./\\./g' | paste -sd'|' -)
 
 # ---------- Colors ----------
@@ -204,10 +211,69 @@ echo -e "  ${GRAY}No Nginx or service restart required.${NC}"
 echo
 }
 
+urls_vhosts() {
+    echo -e "${BLUE}[*] Listing pool virtual host URLs (www-data members):${NC}"
+    echo -e "-----------------------------------------------------------------------------------------------"
+    printf "%-15s %-25s %-10s %-60s\n" "USER" "DOMAIN" "STATUS" "URL(s)"
+    echo -e "-----------------------------------------------------------------------------------------------"
+
+    local users=()
+    while IFS=: read -r name _; do
+        if id -nG "$name" 2>/dev/null | grep -qw www-data; then
+            users+=("$name")
+        fi
+    done < <(getent passwd)
+
+    local total_users=0
+    local total_domains=0
+
+    for user in "${users[@]}"; do
+        total_users=$((total_users + 1))
+        local home="/home/$user"
+        local www_dir="$home/www"
+
+        if [[ ! -d "$www_dir" ]]; then
+            echo -e "${YELLOW}[!] ${CYAN}$user${YELLOW}: no www directory found.${NC}"
+            continue
+        fi
+
+        if [[ ! -r "$www_dir" ]]; then
+            echo -e "${RED}[!] ${CYAN}$user${RED}: insufficient permissions for ${GRAY}$www_dir${NC}"
+            continue
+        fi
+
+        local found=0
+        for domain_dir in "$www_dir"/*; do
+            [[ -d "$domain_dir" ]] || continue
+            found=1
+            total_domains=$((total_domains + 1))
+
+            local name lock status urls=""
+            name=$(basename "$domain_dir")
+            lock="$domain_dir.lock"
+            [[ -f "$lock" ]] && status="${RED}LOCKED${NC}" || status="${GREEN}ACTIVE${NC}"
+
+            for m in "${MASTER_DOMAINS[@]}"; do
+                urls+=$(printf "https://%s.%s:%s/%s, " "$user" "$m" "$PORT" "$name")
+            done
+            urls="${urls%, }"
+
+            printf "%-15s %-25s %-10b     %-60s\n" "$user" "$name" "$status" "$urls"
+        done
+
+        if [[ $found -eq 0 ]]; then
+            echo -e "${GRAY}[i] ${CYAN}$user${GRAY}: no active virtual hosts.${NC}"
+        fi
+    done
+
+    echo -e "-----------------------------------------------------------------------------------------------"
+    echo -e "${GRAY}Summary:${NC} ${total_users} users scanned, ${total_domains} vhosts found."
+}
+
 list_vhosts() {
     echo -e "${BLUE}[*] Listing pool virtual hosts (www-data members):${NC}"
     echo -e "-----------------------------------------------------------------------------------------------"
-    printf "%-15s %-25s %-10s %-60s\n" "USER" "DOMAIN" "STATUS" "URL(s)"
+    printf "%-15s %-25s %-10s %-60s\n" "USER" "DOMAIN" "STATUS" "LOCAL DIRECTORY"
     echo -e "-----------------------------------------------------------------------------------------------"
 
     # --- Collect all users (primary or secondary) in www-data ---
@@ -251,17 +317,12 @@ list_vhosts() {
             found=1
             total_domains=$(($total_domains + 1))
 
-            local name lock status urls=""
+            local name lock status
             name=$(basename "$domain_dir")
             lock="$domain_dir.lock"
             [[ -f "$lock" ]] && status="${RED}LOCKED${NC}" || status="${GREEN}ACTIVE${NC}"
 
-            for m in "${MASTER_DOMAINS[@]}"; do
-                urls+=$(printf "https://%s.%s:%s/%s, " "$user" "$m" "$PORT" "$name")
-            done
-            urls="${urls%, }"
-
-            printf "%-15s %-25s %-10b \t%-60s\n" "$user" "$name" "$status" "$urls"
+            printf "%-15s %-25s %-10b     %-60s\n" "$user" "$name" "$status" "$www_dir/$name"
         done
 
         # [[ $found -eq 0 ]] && echo -e "${GRAY}[i] ${CYAN}$user${GRAY} has no active virtual hosts.${NC}"
@@ -332,6 +393,7 @@ case "$cmd" in
   unlock)   [[ -z "$u" || -z "$d" ]] && usage; unlock_vhost "$u" "$d" ;;
   remove|rm)[[ -z "$u" ]] && usage; remove_vhost "$u" "$d" ;;
   acl)      [[ -z "$u" ]] && usage; fix_acl "$u" "$d" ;;
+  urls)     urls_vhosts ;;
   help|--help|-h) usage ;;
   *)        list_vhosts ;;
 esac
