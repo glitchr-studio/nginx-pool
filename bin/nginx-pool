@@ -8,10 +8,11 @@
 #   nginx-pool lock <user> <domain>
 #   nginx-pool unlock <user> <domain>
 #   nginx-pool remove <user> [domain]
+#   nginx-pool acl <user> [domain]
 #
 # Notes:
 # - Each virtual host maps to:
-#   /home/<user>/www/<domain>/
+#       /home/<user>/www/<domain>/
 # - A ".lock" file prevents distribution of that host.
 # - Removing the lock file re-enables the VH.
 #
@@ -24,7 +25,27 @@
 # ==========================================================
 
 set -euo pipefail
-MASTER=pool.glitchr.dev:8444
+# ---------- Sudo context ----------
+if [[ -n "${SUDO_USER:-}" ]]; then
+    RUN_AS="root (via sudo by $SUDO_USER)"
+    IS_SUDO=1
+else
+    RUN_AS="$USER"
+    IS_SUDO=0
+fi
+
+# ---------- Pool Domains & Port ----------
+PORT=$(awk '/listen/ && /ssl/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) print $i}' /etc/nginx/conf.d/pool.conf)
+
+# Comma-separated list of pool domains
+# Example: MASTER="pool.glitchr.dev,localhost,backup.pool.glitchr.dev"
+MASTER="pool.glitchr.dev,localhost"
+
+# Convert to array
+IFS=',' read -r -a MASTER_DOMAINS <<< "$MASTER"
+
+# Regex-safe version (for internal use)
+MASTER_REGEX=$(printf '%s\n' "${MASTER_DOMAINS[@]}" | sed 's/\./\\./g' | paste -sd'|' -)
 
 # ---------- Colors ----------
 RED='\033[0;31m'
@@ -90,8 +111,6 @@ create_user_if_missing() {
     fi
 }
 
-# ---------- Helpers ----------
-
 fix_acl() {
     local user="$1"
     local domain="${2:-}"
@@ -107,14 +126,12 @@ fix_acl() {
         echo -e "${BLUE}[i] Fixing ACL for all vhosts of ${CYAN}$user${BLUE}...${NC}"
     fi
 
-    # Enforce secure home and shared www
     chmod 700 "/home/$user"
     chmod 700 "$base" 2>/dev/null || true
     setfacl -m u:www-data:--x "/home/$user"
     setfacl -m u:www-data:rwx "/home/$user/www"
     setfacl -d -m u:www-data:rwx "/home/$user/www"
 
-    # Apply recursively if domain is specified
     if [[ -n "$domain" ]]; then
         find "$base" -type d -exec setfacl -m u:www-data:rwx {} \;
         find "$base" -type f -exec setfacl -m u:www-data:rw- {} \;
@@ -123,17 +140,8 @@ fix_acl() {
     echo -e "${GREEN}[✓] ACL permissions updated for ${CYAN}$user${GREEN} ${domain:+/$domain}.${NC}"
 }
 
-# ---------- Commands ----------
-
-acl_fix_command() {
-    local user="$1" domain="${2:-}"
-    [[ -z "$user" ]] && usage
-    fix_acl "$user" "$domain"
-}
-
 add_vhost() {
     require_root
-
     local user="$1" domain="$2"
     local base site sock
     base=$(vhost_path "$user" "$domain")
@@ -158,78 +166,126 @@ add_vhost() {
 </body>
 </html>
 EOF
+
 echo
 echo -e "${GREEN}[✓] Virtual host ${CYAN}$domain${GREEN} created for ${CYAN}$user${GREEN}.${NC}"
 echo -e "    ${GRAY}Base path:    ${CYAN}$base${NC}"
 echo -e "    ${GRAY}Public path:  ${CYAN}$site${NC}"
 echo -e "    ${GRAY}Socket path:  ${CYAN}$sock${NC}"
 echo -e "    ${GRAY}Lock file:    ${CYAN}${base}.lock${NC}"
-echo -e "    ${GRAY}URL:          ${BLUE}https://$user.${MASTER}/$domain/${NC} | ${BLUE}https://$user.localhost/$domain/${NC}"
+echo -e "    ${GRAY}URLs:${NC}"
+for m in "${MASTER_DOMAINS[@]}"; do
+    echo -e "      ${BLUE}https://$user.$m:$PORT/$domain/${NC}"
+done
 
-# Deployment guidance
 echo
 echo -e "${BLUE}──────────────────────────────"
 echo -e " Deployment Guide"
 echo -e "──────────────────────────────${NC}"
-
 echo -e " ${GREEN}1.${NC} ${CYAN}$sock${NC}"
 echo -e "     ${GRAY}Create this UNIX socket for your app (FrankenPHP, Symfony, Node.js, etc.).${NC}"
-
 echo -e " ${GREEN}2.${NC} ${CYAN}$base/(public/|current/)?index.php${NC}"
 echo -e "     ${GRAY}Main PHP entry point (used by dynamic frameworks).${NC}"
-
 echo -e " ${GREEN}3.${NC} ${CYAN}$base/(public/|current/)?index.html${NC}"
 echo -e "     ${GRAY}Static fallback (used when no PHP entry is found).${NC}"
-
 echo -e " ${GREEN}4.${NC} ${CYAN}/home/nginx/www/localhost${NC}"
 echo -e "     ${GRAY}Global fallback directory (shared by all virtual hosts).${NC}"
-
 echo -e " ${GREEN}5.${NC} ${CYAN}/usr/share/nginx/html${NC}"
 echo -e "     ${GRAY}Default Nginx HTML directory (final fallback).${NC}"
-
+echo
+echo -e "${YELLOW}> Once ready, remove the lock file${NC} to publish your website."
+echo
 echo -e "${BLUE}──────────────────────────────"
 echo -e " Tip"
 echo -e "──────────────────────────────${NC}"
 echo -e "  For fast distribution, place your runtime socket here: ${CYAN}$sock${NC}"
-echo -e "  ${GRAY}This enables direct UNIX socket communication (no TCP).${NC}"
-echo -e "  ${GRAY}No Nginx or service restart required for propagation.${NC}"
+echo -e "  ${GRAY}Direct UNIX socket communication (no TCP).${NC}"
+echo -e "  ${GRAY}No Nginx or service restart required.${NC}"
 echo
-
 }
 
 list_vhosts() {
-    echo -e "${BLUE}[*] Listing pool users (in www-data group):${NC}"
-    printf "%-15s %-25s %-10s %-50s\n" "USER" "DOMAIN" "STATUS" "PATH"
-    echo "-----------------------------------------------------------------------------------------------"
-    for user in $(getent group www-data | awk -F: '{print $4}' | tr ',' ' '); do
-        [[ -d "/home/$user/www" ]] || continue
-        for domain in "/home/$user/www"/*; do
-            [[ -d "$domain" ]] || continue
-            name=$(basename "$domain")
-            lock="/home/$user/www/$name.lock"
+    echo -e "${BLUE}[*] Listing pool virtual hosts (www-data members):${NC}"
+    echo -e "-----------------------------------------------------------------------------------------------"
+    printf "%-15s %-25s %-10s %-60s\n" "USER" "DOMAIN" "STATUS" "URL(s)"
+    echo -e "-----------------------------------------------------------------------------------------------"
+
+    # --- Collect all users (primary or secondary) in www-data ---
+    local users=()
+    while IFS=: read -r name _; do
+        if id -nG "$name" 2>/dev/null | grep -qw www-data; then
+            users+=("$name")
+        fi
+    done < <(getent passwd)
+
+    local total_users=0
+    local total_domains=0
+
+    for user in "${users[@]}"; do
+
+        total_users=$(($total_users + 1))
+        local home="/home/$user"
+        local www_dir="$home/www"
+        
+        # --- Check directory existence and permissions ---
+        if [[ ! -r "$www_dir" ]]; then
+
+            if [[ ! -d "$home" ]]; then
+                continue
+            fi
+
+            if [ $IS_SUDO -eq 1 ]; then
+                echo -e "${YELLOW}[!] ${CYAN}$user${YELLOW}: no www directory found at ${GRAY}$www_dir${NC}"
+            else
+                echo -e "${RED}[!] ${CYAN}$user${RED}: insufficient permissions for ${GRAY}$www_dir${NC}"
+            fi
+
+            continue
+        fi
+
+        # --- Enumerate domains if accessible ---
+        local found=0
+        for domain_dir in "$www_dir"/*; do
+            
+            [[ -d "$domain_dir" ]] || continue
+            found=1
+            total_domains=$(($total_domains + 1))
+
+            local name lock status urls=""
+            name=$(basename "$domain_dir")
+            lock="$domain_dir.lock"
             [[ -f "$lock" ]] && status="${RED}LOCKED${NC}" || status="${GREEN}ACTIVE${NC}"
-            printf "%-15s %-25s %-10b %-50s\n" "$user" "$name" "$status" "$domain"
+
+            for m in "${MASTER_DOMAINS[@]}"; do
+                urls+=$(printf "https://%s.%s:%s/%s, " "$user" "$m" "$PORT" "$name")
+            done
+            urls="${urls%, }"
+
+            printf "%-15s %-25s %-10b \t%-60s\n" "$user" "$name" "$status" "$urls"
         done
+
+        # [[ $found -eq 0 ]] && echo -e "${GRAY}[i] ${CYAN}$user${GRAY} has no active virtual hosts.${NC}"
     done
+
+    echo -e "-----------------------------------------------------------------------------------------------"
+    echo -e "${GRAY}Summary:${NC} ${total_users} users scanned, ${total_domains} vhosts found."
 }
 
 lock_vhost() {
-    local user="$1" domain="$2" lock
-    lock=$(vhost_lock_path "$user" "$domain")
+    local user="$1" domain="$2"
+    local lock=$(vhost_lock_path "$user" "$domain")
     [[ -d $(vhost_path "$user" "$domain") ]] || { echo -e "${RED}[!] No such vhost: $user/$domain${NC}"; exit 1; }
     touch "$lock"
     echo -e "${YELLOW}[−] Locked ${CYAN}$user/$domain${YELLOW}.${NC}"
-    echo -e "${YELLOW}[i] Distribution paused. Remove ${CYAN}$lock${YELLOW} to re-enable this virtual host.${NC}"
+    echo -e "${YELLOW}[i] Distribution paused. Remove ${CYAN}$lock${YELLOW} to re-enable.${NC}"
 }
 
 unlock_vhost() {
-
-    local user="$1" domain="$2" lock
-    lock=$(vhost_lock_path "$user" "$domain")
+    local user="$1" domain="$2"
+    local lock=$(vhost_lock_path "$user" "$domain")
     if [[ -f "$lock" ]]; then
         rm -f "$lock"
         echo -e "${GREEN}[✓] Unlocked ${CYAN}$user/$domain${GREEN}.${NC}"
-        echo -e "${BLUE}[i] Virtual host is now distributed again.${NC}"
     else
         echo -e "${YELLOW}[i] Already unlocked.${NC}"
     fi
@@ -237,11 +293,10 @@ unlock_vhost() {
 
 remove_vhost() {
     require_root
-
     local user="$1" domain="${2:-}"
     if [[ -z "$domain" ]]; then
         if id "$user" &>/dev/null; then
-            if confirm "Remove user '$user' (data will be conserved)?"; then
+            if confirm "Remove user '$user' (data preserved)?"; then
                 userdel "$user" 2>/dev/null || true
                 echo -e "${RED}[✗] User '$user' removed.${NC}"
             else
@@ -251,7 +306,7 @@ remove_vhost() {
             echo -e "${RED}[!] User '$user' does not exist.${NC}"
         fi
     else
-        local path; path=$(vhost_path "$user" "$domain")
+        local path=$(vhost_path "$user" "$domain")
         if [[ -d "$path" ]]; then
             if confirm "Remove domain '$domain' for user '$user'?"; then
                 mv "$path" "$path.disabled.$(date +%s)"
@@ -273,11 +328,10 @@ d="${3:-}"
 
 case "$cmd" in
   add)      [[ -z "$u" || -z "$d" ]] && usage; add_vhost "$u" "$d" ;;
-  list)     list_vhosts ;;
   lock)     [[ -z "$u" || -z "$d" ]] && usage; lock_vhost "$u" "$d" ;;
   unlock)   [[ -z "$u" || -z "$d" ]] && usage; unlock_vhost "$u" "$d" ;;
   remove|rm)[[ -z "$u" ]] && usage; remove_vhost "$u" "$d" ;;
-  acl)       [[ -z "$u" ]] && usage; acl_fix_command "$u" "$d" ;;
+  acl)      [[ -z "$u" ]] && usage; fix_acl "$u" "$d" ;;
   help|--help|-h) usage ;;
-  *)        usage ;;
+  *)        list_vhosts ;;
 esac

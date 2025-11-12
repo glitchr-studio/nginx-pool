@@ -6,7 +6,9 @@ nginx:
 	@cp nginx.conf /etc/nginx/
 
 conf:
+	@cp bin/* /usr/local/bin/
 	@cp conf.d/* /etc/nginx/conf.d
+	@touch /etc/nginx/user_map.conf
 	@nginx -t
 
 reload:
