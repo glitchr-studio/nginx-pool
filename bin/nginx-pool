@@ -1,0 +1,283 @@
+#!/bin/bash
+# ==========================================================
+# nginx-pool : Manage users and virtual hosts for ${MASTER}|localhost
+# ----------------------------------------------------------
+# Usage:
+#   nginx-pool add <user> <domain>
+#   nginx-pool list
+#   nginx-pool lock <user> <domain>
+#   nginx-pool unlock <user> <domain>
+#   nginx-pool remove <user> [domain]
+#
+# Notes:
+# - Each virtual host maps to:
+#   /home/<user>/www/<domain>/
+# - A ".lock" file prevents distribution of that host.
+# - Removing the lock file re-enables the VH.
+#
+# Smart fallback chain in NGINX (in order):
+#   (1)  <user>/<domain>.sock     ← main dynamic backend
+#   (2)  <user>/<domain>/(public/|current/)?index.php or index.html
+#   (3)  /home/nginx/www/localhost.sock (global PHP pool)
+#   (4)  /home/nginx/www/localhost/(public/|current/)?index.php|html
+#   (5)  /usr/share/nginx/html/index.html (final fallback)
+# ==========================================================
+
+set -euo pipefail
+MASTER=pool.glitchr.dev:8444
+
+# ---------- Colors ----------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+CYAN='\033[0;36m'
+GRAY='\033[0;37m'
+NC='\033[0m' # No Color / Reset
+
+# ---------- Helpers ----------
+usage() {
+    echo -e "${YELLOW}Usage:${NC}"
+    echo -e "  $0 add <user> <domain>"
+    echo -e "  $0 list"
+    echo -e "  $0 lock <user> <domain>"
+    echo -e "  $0 unlock <user> <domain>"
+    echo -e "  $0 remove <user> [domain]"
+    echo -e "  $0 acl <user> [domain]"
+    echo
+    echo -e "${BLUE}Fallback chain:${NC}"
+    echo -e "  1) /home/<user>/www/<domain>.sock"
+    echo -e "  2) /home/<user>/www/<domain>/(public/|current/)?index.php|html"
+    echo -e "  3) /home/nginx/www/localhost.sock"
+    echo -e "  4) /home/nginx/www/localhost/(public/|current/)?index.php|html"
+    echo -e "  5) /usr/share/nginx/html/index.html"
+    echo
+    echo -e "${YELLOW}Lock behavior:${NC}"
+    echo -e "  - To pause routing, a lock file is created at:"
+    echo -e "      /home/<user>/www/<domain>.lock"
+    echo -e "  - To reactivate the VH, simply remove this file or run:"
+    echo -e "      nginx-pool unlock <user> <domain>"
+    exit 1
+}
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}[!] Must be run as root.${NC}"
+        exit 1
+    fi
+}
+
+vhost_path() { echo "/home/$1/www/$2"; }
+vhost_lock_path() { echo "/home/$1/www/$2.lock"; }
+
+confirm() {
+    local msg="$1"
+    read -rp "$(echo -e ${YELLOW}$msg${NC}) [y/N]: " yn
+    [[ "$yn" =~ ^[Yy]$ ]]
+}
+
+create_user_if_missing() {
+    local user="$1"
+    if ! id "$user" &>/dev/null; then
+        echo -e "${BLUE}[+] Creating system user '${CYAN}$user${BLUE}'...${NC}"
+        useradd -m -s /bin/bash -G www-data "$user"
+        echo -e "${GREEN}[✓] Added to group www-data.${NC}"
+    else
+        if ! id -nG "$user" | grep -qw www-data; then
+            usermod -aG www-data "$user"
+            echo -e "${GREEN}[✓] Added existing user '${CYAN}$user${GREEN}' to group www-data.${NC}"
+        fi
+    fi
+}
+
+# ---------- Helpers ----------
+
+fix_acl() {
+    local user="$1"
+    local domain="${2:-}"
+    local base
+
+    if [[ -n "$domain" ]]; then
+        base="/home/$user/www/$domain"
+        [[ -d "$base" ]] || { echo -e "${RED}[!] No such vhost: $user/$domain${NC}"; exit 1; }
+        echo -e "${BLUE}[i] Fixing ACL for ${CYAN}$user/$domain${BLUE}...${NC}"
+    else
+        base="/home/$user/www"
+        [[ -d "$base" ]] || { echo -e "${RED}[!] No www directory for user '$user'.${NC}"; exit 1; }
+        echo -e "${BLUE}[i] Fixing ACL for all vhosts of ${CYAN}$user${BLUE}...${NC}"
+    fi
+
+    # Enforce secure home and shared www
+    chmod 700 "/home/$user"
+    chmod 700 "$base" 2>/dev/null || true
+    setfacl -m u:www-data:--x "/home/$user"
+    setfacl -m u:www-data:rwx "/home/$user/www"
+    setfacl -d -m u:www-data:rwx "/home/$user/www"
+
+    # Apply recursively if domain is specified
+    if [[ -n "$domain" ]]; then
+        find "$base" -type d -exec setfacl -m u:www-data:rwx {} \;
+        find "$base" -type f -exec setfacl -m u:www-data:rw- {} \;
+    fi
+
+    echo -e "${GREEN}[✓] ACL permissions updated for ${CYAN}$user${GREEN} ${domain:+/$domain}.${NC}"
+}
+
+# ---------- Commands ----------
+
+acl_fix_command() {
+    local user="$1" domain="${2:-}"
+    [[ -z "$user" ]] && usage
+    fix_acl "$user" "$domain"
+}
+
+add_vhost() {
+    require_root
+
+    local user="$1" domain="$2"
+    local base site sock
+    base=$(vhost_path "$user" "$domain")
+    site="$base/public"
+    sock="$base.sock"
+
+    create_user_if_missing "$user"
+    mkdir -p "$base"
+    chown -R "$user:$user" "/home/$user"
+    chmod 700 "/home/$user" "/home/$user/www"
+    setfacl -m u:www-data:--x "/home/$user"
+    setfacl -m u:www-data:rwx "/home/$user/www"
+    setfacl -d -m u:www-data:rwx "/home/$user/www"
+
+    [[ -f "$base/index.html" ]] || cat > "$base/index.html" <<EOF
+<!DOCTYPE html>
+<html>
+<head><title>$domain</title></head>
+<body style="font-family:sans-serif;">
+<h1>Welcome to $domain</h1>
+<p>Served from <code>$site</code>.</p>
+</body>
+</html>
+EOF
+echo
+echo -e "${GREEN}[✓] Virtual host ${CYAN}$domain${GREEN} created for ${CYAN}$user${GREEN}.${NC}"
+echo -e "    ${GRAY}Base path:    ${CYAN}$base${NC}"
+echo -e "    ${GRAY}Public path:  ${CYAN}$site${NC}"
+echo -e "    ${GRAY}Socket path:  ${CYAN}$sock${NC}"
+echo -e "    ${GRAY}Lock file:    ${CYAN}${base}.lock${NC}"
+echo -e "    ${GRAY}URL:          ${BLUE}https://$user.${MASTER}/$domain/${NC} | ${BLUE}https://$user.localhost/$domain/${NC}"
+
+# Deployment guidance
+echo
+echo -e "${BLUE}──────────────────────────────"
+echo -e " Deployment Guide"
+echo -e "──────────────────────────────${NC}"
+
+echo -e " ${GREEN}1.${NC} ${CYAN}$sock${NC}"
+echo -e "     ${GRAY}Create this UNIX socket for your app (FrankenPHP, Symfony, Node.js, etc.).${NC}"
+
+echo -e " ${GREEN}2.${NC} ${CYAN}$base/(public/|current/)?index.php${NC}"
+echo -e "     ${GRAY}Main PHP entry point (used by dynamic frameworks).${NC}"
+
+echo -e " ${GREEN}3.${NC} ${CYAN}$base/(public/|current/)?index.html${NC}"
+echo -e "     ${GRAY}Static fallback (used when no PHP entry is found).${NC}"
+
+echo -e " ${GREEN}4.${NC} ${CYAN}/home/nginx/www/localhost${NC}"
+echo -e "     ${GRAY}Global fallback directory (shared by all virtual hosts).${NC}"
+
+echo -e " ${GREEN}5.${NC} ${CYAN}/usr/share/nginx/html${NC}"
+echo -e "     ${GRAY}Default Nginx HTML directory (final fallback).${NC}"
+
+echo -e "${BLUE}──────────────────────────────"
+echo -e " Tip"
+echo -e "──────────────────────────────${NC}"
+echo -e "  For fast distribution, place your runtime socket here: ${CYAN}$sock${NC}"
+echo -e "  ${GRAY}This enables direct UNIX socket communication (no TCP).${NC}"
+echo -e "  ${GRAY}No Nginx or service restart required for propagation.${NC}"
+echo
+
+}
+
+list_vhosts() {
+    echo -e "${BLUE}[*] Listing pool users (in www-data group):${NC}"
+    printf "%-15s %-25s %-10s %-50s\n" "USER" "DOMAIN" "STATUS" "PATH"
+    echo "-----------------------------------------------------------------------------------------------"
+    for user in $(getent group www-data | awk -F: '{print $4}' | tr ',' ' '); do
+        [[ -d "/home/$user/www" ]] || continue
+        for domain in "/home/$user/www"/*; do
+            [[ -d "$domain" ]] || continue
+            name=$(basename "$domain")
+            lock="/home/$user/www/$name.lock"
+            [[ -f "$lock" ]] && status="${RED}LOCKED${NC}" || status="${GREEN}ACTIVE${NC}"
+            printf "%-15s %-25s %-10b %-50s\n" "$user" "$name" "$status" "$domain"
+        done
+    done
+}
+
+lock_vhost() {
+    local user="$1" domain="$2" lock
+    lock=$(vhost_lock_path "$user" "$domain")
+    [[ -d $(vhost_path "$user" "$domain") ]] || { echo -e "${RED}[!] No such vhost: $user/$domain${NC}"; exit 1; }
+    touch "$lock"
+    echo -e "${YELLOW}[−] Locked ${CYAN}$user/$domain${YELLOW}.${NC}"
+    echo -e "${YELLOW}[i] Distribution paused. Remove ${CYAN}$lock${YELLOW} to re-enable this virtual host.${NC}"
+}
+
+unlock_vhost() {
+
+    local user="$1" domain="$2" lock
+    lock=$(vhost_lock_path "$user" "$domain")
+    if [[ -f "$lock" ]]; then
+        rm -f "$lock"
+        echo -e "${GREEN}[✓] Unlocked ${CYAN}$user/$domain${GREEN}.${NC}"
+        echo -e "${BLUE}[i] Virtual host is now distributed again.${NC}"
+    else
+        echo -e "${YELLOW}[i] Already unlocked.${NC}"
+    fi
+}
+
+remove_vhost() {
+    require_root
+
+    local user="$1" domain="${2:-}"
+    if [[ -z "$domain" ]]; then
+        if id "$user" &>/dev/null; then
+            if confirm "Remove user '$user' (data will be conserved)?"; then
+                userdel "$user" 2>/dev/null || true
+                echo -e "${RED}[✗] User '$user' removed.${NC}"
+            else
+                echo -e "${YELLOW}[i] Cancelled.${NC}"
+            fi
+        else
+            echo -e "${RED}[!] User '$user' does not exist.${NC}"
+        fi
+    else
+        local path; path=$(vhost_path "$user" "$domain")
+        if [[ -d "$path" ]]; then
+            if confirm "Remove domain '$domain' for user '$user'?"; then
+                mv "$path" "$path.disabled.$(date +%s)"
+                rm -f "$path.lock" || true
+                echo -e "${GREEN}[✓] Domain ${CYAN}$domain${GREEN} disabled (data preserved).${NC}"
+            else
+                echo -e "${YELLOW}[i] Cancelled.${NC}"
+            fi
+        else
+            echo -e "${RED}[!] No such domain: $user/$domain${NC}"
+        fi
+    fi
+}
+
+# ---------- Main ----------
+cmd="${1:-}"
+u="${2:-}"
+d="${3:-}"
+
+case "$cmd" in
+  add)      [[ -z "$u" || -z "$d" ]] && usage; add_vhost "$u" "$d" ;;
+  list)     list_vhosts ;;
+  lock)     [[ -z "$u" || -z "$d" ]] && usage; lock_vhost "$u" "$d" ;;
+  unlock)   [[ -z "$u" || -z "$d" ]] && usage; unlock_vhost "$u" "$d" ;;
+  remove|rm)[[ -z "$u" ]] && usage; remove_vhost "$u" "$d" ;;
+  acl)       [[ -z "$u" ]] && usage; acl_fix_command "$u" "$d" ;;
+  help|--help|-h) usage ;;
+  *)        usage ;;
+esac
