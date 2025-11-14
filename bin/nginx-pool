@@ -5,10 +5,12 @@
 # Usage:
 #   nginx-pool add <user> <domain> [--master <domain>]
 #   nginx-pool list [--urls] [--master <domain>]
+#   nginx-pool extend-cert <domain>
 #   nginx-pool lock <user> <domain>
 #   nginx-pool unlock <user> <domain>
 #   nginx-pool remove <user> [domain]
 #   nginx-pool acl <user> [domain]
+#   nginx-pool update-user-map
 #
 # Notes:
 # - Each virtual host maps to:
@@ -80,14 +82,18 @@ usage() {
     echo -e "${YELLOW}Usage:${NC}"
     echo -e "  $0 add <user> <domain> [--master <domain>]"
     echo -e "  $0 list [--urls] [--master <domain>]"
+    echo -e "  $0 extend-cert <domain>"
+    echo -e "  $0 show-certs"
+    echo -e "  $0 cert-renew"
     echo -e "  $0 lock <user> <domain>"
     echo -e "  $0 unlock <user> <domain>"
     echo -e "  $0 remove <user> [domain]"
     echo -e "  $0 acl <user> [domain]"
+    echo -e "  $0 update-user-map"
     echo
     echo -e "${BLUE}Examples:${NC}"
-    echo -e "  $0 list --urls --master pool.glitchr.dev"
-    echo -e "  $0 add alice example.com --master pool.glitchr.dev"
+    echo -e "  $0 list --urls --master pool.domain.com"
+    echo -e "  $0 add alice example.com --master pool.domain.com"
     echo
     exit 1
 }
@@ -161,10 +167,270 @@ fix_acl() {
     chmod 700 "/home/$user"
     chmod 700 "$base" 2>/dev/null || true
     setfacl -m u:www-data:--x "/home/$user"
-    setfacl -Rm u:www-data:rwx "$base"
-    setfacl -Rdm u:www-data:rwx "$base"
+    setfacl -R -m u:www-data:rwx "$base"
+    setfacl -R -d -m u:www-data:rwx "$base"
 
     echo -e "${GREEN}[✓] ACL permissions updated for ${CYAN}$user${GREEN}${domain:+/$domain}.${NC}"
+}
+
+extend_cert() {
+    require_root
+
+    local cert_name="$MASTER"
+    local webroot="/var/www/letsencrypt"
+
+    mkdir -p "$webroot"
+    chown www-data:www-data "$webroot"
+
+    local filters=("$@")
+    if [[ ${#filters[@]} -eq 0 ]]; then
+        echo -e "${RED}[!] Missing filter (ex: '*.apfelschorlette.fr')${NC}"
+        exit 1
+    fi
+
+    # ============================================================
+    # 1. Load existing SAN list for this certificate
+    # ============================================================
+    local san_line
+    san_line=$(certbot certificates --cert-name "$cert_name" 2>/dev/null \
+              | awk '/^[[:space:]]+Domains:/ {sub(/^[[:space:]]+Domains:[[:space:]]*/, "", $0); print; exit}')
+
+    if [[ -z "$san_line" ]]; then
+        echo -e "${RED}[!] No existing certificate found for ${CYAN}$cert_name${RED}.${NC}"
+        echo -e "${YELLOW}Create it first with certbot before using extend-cert.${NC}"
+        exit 1
+    fi
+
+    IFS=' ' read -r -a current_san <<< "$san_line"
+    declare -A present=()
+    for d in "${current_san[@]}"; do
+        present["$d"]=1
+    done
+
+    # ============================================================
+    # 2. Discover candidate domains from /home/<user>/www/<domain>
+    # ============================================================
+    echo -e "${BLUE}[*] Discovering candidate domains...${NC}"
+    declare -A seen=()
+    local candidates=()
+
+    while IFS=: read -r user _; do
+        if id -nG "$user" 2>/dev/null | grep -qw www-data; then
+            local root="/home/$user/www"
+            [[ -d "$root" ]] || continue
+
+            for d in "$root"/*; do
+                [[ -d "$d" ]] || continue
+                local dom
+                dom=$(basename "$d")
+
+                [[ "$dom" =~ \.lock$ ]] && continue
+
+                if [[ -z "${seen[$dom]:-}" ]]; then
+                    seen["$dom"]=1
+                    candidates+=("$dom")
+                fi
+            done
+        fi
+    done < <(getent passwd)
+
+    echo -e "${CYAN}→ Found ${#candidates[@]} candidate domains.${NC}"
+
+    # ============================================================
+    # 3. Apply wildcard / literal filters
+    #    "*.apfelschorlette.fr" → match any domain ending in ".apfelschorlette.fr"
+    # ============================================================
+    local selected=()
+    local flat_filters=()
+
+    # flatten comma-separated filters
+    for f in "${filters[@]}"; do
+        IFS=',' read -ra parts <<< "$f"
+        for p in "${parts[@]}"; do
+            [[ -n "$p" ]] && flat_filters+=("$p")
+        done
+    done
+
+    for dom in "${candidates[@]}"; do
+        local match=0
+        for f in "${flat_filters[@]}"; do
+            if [[ "$f" == \*.* ]]; then
+                local base="${f#*.}"    # "*.apfelschorlette.fr" → "apfelschorlette.fr"
+                [[ "$dom" == *".$base" ]] && match=1 && break
+            else
+                [[ "$dom" == "$f" ]] && match=1 && break
+            fi
+        done
+        (( match == 1 )) && selected+=("$dom")
+    done
+
+    if [[ ${#selected[@]} -eq 0 ]]; then
+        echo -e "${RED}[!] No domains matched the filters.${NC}"
+        exit 1
+    fi
+
+    echo -e "${BLUE}[*] Selected domains (after filtering):${NC}"
+    for d in "${selected[@]}"; do
+        echo -e "  • ${GREEN}$d${NC}"
+    done
+    echo
+
+    # ============================================================
+    # 4. Merge existing SAN + selected → final SAN list
+    #    (keep everything that already exists, add new)
+    # ============================================================
+    declare -A merged=()
+    local final_san=()
+
+    # keep existing SANs
+    for d in "${current_san[@]}"; do
+        if [[ -z "${merged[$d]:-}" ]]; then
+            merged["$d"]=1
+            final_san+=("$d")
+        fi
+    done
+
+    # add selected domains (only if not already present)
+    local new_domains=()
+    for d in "${selected[@]}"; do
+        if [[ -z "${merged[$d]:-}" ]]; then
+            merged["$d"]=1
+            final_san+=("$d")
+            new_domains+=("$d")
+        fi
+    done
+
+    if [[ ${#new_domains[@]} -eq 0 ]]; then
+        echo -e "${GREEN}[✓] All matching domains are already present in certificate ${CYAN}$cert_name${GREEN}.${NC}"
+        return 0
+    fi
+
+    echo -e "${BLUE}[*] New domains to be added to ${CYAN}$cert_name${BLUE}:${NC}"
+    for d in "${new_domains[@]}"; do
+        echo -e "  + ${GREEN}$d${NC}"
+    done
+    echo
+
+    # ============================================================
+    # 5. Call certbot with FULL SAN LIST (to avoid removals)
+    # ============================================================
+    echo -e "${BLUE}[*] Calling Certbot (--expand) with merged SAN list...${NC}"
+
+    certbot certonly \
+        --webroot -w "$webroot" \
+        --expand \
+        --cert-name "$cert_name" \
+        $(printf ' -d %s' "${final_san[@]}")
+
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}[✗] Certbot failed.${NC}"
+        exit 1
+    fi
+
+    systemctl reload nginx
+    echo -e "${GREEN}[✓] Certificate ${CYAN}$cert_name${GREEN} extended successfully.${NC}"
+}
+
+show_certs() {
+    require_root
+
+    echo -e "${BLUE}[*] Listing all certificates managed by Certbot...${NC}"
+    echo
+
+    local current_name=""
+    local in_block=0
+
+    certbot certificates 2>/dev/null | while IFS= read -r line; do
+
+        # Detect start of a certificate block
+        if [[ "$line" =~ ^Certificate\ Name:\ (.*)$ ]]; then
+            current_name="${BASH_REMATCH[1]}"
+            in_block=1
+            echo -e "${CYAN}Certificate Name:${NC}  ${GREEN}$current_name${NC}"
+            continue
+        fi
+
+        # Parse inside block
+        if [[ $in_block -eq 1 ]]; then
+            # Domains
+            if [[ "$line" =~ ^\ \ Domains:\ (.*)$ ]]; then
+                echo -e "${GRAY}Domains:${NC}        ${YELLOW}${BASH_REMATCH[1]}${NC}"
+            fi
+
+            # Expiry
+            if [[ "$line" =~ ^\ \ Expiry\ Date:\ (.*)$ ]]; then
+                local expiry="${BASH_REMATCH[1]}"
+                echo -e "${GRAY}Expiry Date:${NC}    ${expiry}"
+
+                # Warn about soon-expiring certs
+                if [[ "$expiry" =~ "VALID" ]]; then
+                    : # OK
+                else
+                    echo -e "               ${RED}[!] Certificate may be expired${NC}"
+                fi
+            fi
+
+            # Certificate path
+            if [[ "$line" =~ ^\ \ Certificate\ Path:\ (.*)$ ]]; then
+                echo -e "${GRAY}Certificate:${NC}    ${BASH_REMATCH[1]}"
+            fi
+
+            # Private key path
+            if [[ "$line" =~ ^\ \ Private\ Key\ Path:\ (.*)$ ]]; then
+                echo -e "${GRAY}Private Key:${NC}    ${BASH_REMATCH[1]}"
+                echo -e "------------------------------------------------------------"
+                in_block=0
+            fi
+        fi
+
+    done
+
+    echo
+    echo -e "${GREEN}[✓] Done.${NC}"
+}
+
+cert_renew() {
+    require_root
+
+    echo -e "${BLUE}[*] Forcing certificate renewal using Certbot...${NC}"
+    echo
+
+    # Run certbot renew
+    local output
+    output=$(certbot renew 2>&1)
+    local status=$?
+
+    echo "$output"
+
+    # Check result
+    if [[ $status -ne 0 ]]; then
+        echo
+        echo -e "${RED}[✗] Certbot renewal failed!${NC}"
+        echo -e "${YELLOW}Check logs:${NC} /var/log/letsencrypt/letsencrypt.log"
+        exit 1
+    fi
+
+    # Determine if any certificates were actually renewed
+    if echo "$output" | grep -q "No renewals were attempted"; then
+        echo
+        echo -e "${CYAN}[i] No certificates required renewal.${NC}"
+    else
+        echo
+        echo -e "${GREEN}[✓] Certificates successfully renewed.${NC}"
+    fi
+
+    echo -e "${BLUE}[*] Reloading nginx...${NC}"
+    systemctl reload nginx
+
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}[✓] NGINX reloaded successfully.${NC}"
+    else
+        echo -e "${RED}[✗] Failed to reload NGINX — please check configuration!${NC}"
+        exit 1
+    fi
+
+    echo
+    echo -e "${GREEN}[✓] Renewal process completed.${NC}"
 }
 
 add_vhost() {
@@ -180,8 +446,8 @@ add_vhost() {
     chown -R "$user:$user" "/home/$user"
     chmod 700 "/home/$user" "/home/$user/www"
     setfacl -m u:www-data:--x "/home/$user"
-    setfacl -m u:www-data:rwx "/home/$user/www"
-    setfacl -d -m u:www-data:rwx "/home/$user/www"
+    setfacl -R -m u:www-data:rwx "/home/$user/www"
+    setfacl -R -d -m u:www-data:rwx "/home/$user/www"
 
     [[ -f "$base/index.html" ]] || cat > "$base/index.html" <<EOF
 <!DOCTYPE html>
@@ -202,6 +468,62 @@ EOF
     echo -e "    ${GRAY}Lock file:    ${CYAN}${base}.lock${NC}"
     echo -e "    ${GRAY}URLs:${NC}"
     echo -e "      ${BLUE}https://$user.$MASTER:$PORT/$domain/${NC}"
+}
+
+update_user_map() {
+
+    require_root
+
+    local map_file="/etc/nginx/user.map"
+    local tmp_file="${map_file}.tmp"
+
+    echo -e "${BLUE}[*] Rebuilding NGINX user → domain map from /home/*/www/... ${NC}"
+
+    # Header
+    {
+        echo "# Auto-generated by nginx-pool update-user-map"
+        echo "# Format: domain   user"
+        echo
+    } > "$tmp_file"
+
+    local total_entries=0
+    local -A seen_domains=()   # Dedup if domain appears twice
+
+    # --- Scan only www-data users ---
+    while IFS=: read -r name _; do
+        if id -nG "$name" 2>/dev/null | grep -qw www-data; then
+            local dir="/home/$name/www"
+            [[ -d "$dir" ]] || continue
+
+            # --- Scan /home/<user>/www/<domain> ---
+            for d in "$dir"/*; do
+                [[ -d "$d" ]] || continue
+                local domain
+                domain=$(basename "$d")
+
+                # Skip lock files or weird hidden dirs
+                [[ "$domain" =~ \.lock$ ]] && continue
+
+                # Avoid duplicates
+                if [[ -n "${seen_domains[$domain]:-}" ]]; then
+                    echo -e "${YELLOW}[!] Duplicate domain detected:${NC} $domain"
+                    continue
+                fi
+                seen_domains[$domain]="$name"
+
+                printf "%s\t%s;\n" "$domain" "$name" >> "$tmp_file"
+                echo -e "${CYAN}→ ${GREEN}$domain${NC} mapped to ${BLUE}$name${NC}"
+                total_entries=$((total_entries + 1))
+            done
+        fi
+    done < <(getent passwd)
+
+    # Atomic replace
+    mv "$tmp_file" "$map_file"
+
+    echo
+    echo -e "${GREEN}[✓] Updated $map_file${NC} with $total_entries entries."
+    echo -e "${YELLOW}Reload nginx: systemctl reload nginx${NC}"
 }
 
 list_vhosts() {
@@ -320,6 +642,13 @@ case "$cmd" in
   remove|rm)[[ -z "$u" ]] && usage; remove_vhost "$u" "$d" ;;
   acl)      [[ -z "$u" ]] && usage; fix_acl "$u" "$d" ;;
   list|"")  list_vhosts "*" "$SHOW_URLS" ;;
+  show-certs) show_certs ;;
+  cert-renew) cert_renew ;;
+  extend-cert)
+    [[ -z "$u" ]] && usage
+    extend_cert "$u"
+    ;;
+  update-user-map) update_user_map ;;
   help|--help|-h) usage ;;
   *) echo -e "${RED}[!] Unknown command: $cmd${NC}"; usage ;;
 esac
