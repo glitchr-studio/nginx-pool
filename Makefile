@@ -7,18 +7,18 @@ ifneq ("$(wildcard .env)","")
 endif
 
 DOMAIN ?= localhost
-ESC_DOMAIN := $(subst .,\.,$(DOMAIN))
-ESC2_DOMAIN := $(subst .,\\\.,$(DOMAIN))
+DOMAIN_ESC := $(subst .,\.,$(DOMAIN))
+DOMAIN_ESC2 := $(subst .,\\\.,$(DOMAIN))
 
 # ------------------------------------------------------
 # Template replacement task
 # ------------------------------------------------------
 build-config:
-	@sed -e "s/{{DOMAIN}}/$(ESC_DOMAIN)/g" \
-		 -e "s/{{ESC_DOMAIN}}/$(ESC2_DOMAIN)/g" \
+	@sed -e "s/{{DOMAIN}}/$(DOMAIN_ESC)/g" \
+		 -e "s/{{DOMAIN_ESC}}/$(DOMAIN_ESC2)/g" \
 		 nginx.conf.template > nginx.conf
-	@sed -e "s/{{DOMAIN}}/$(ESC_DOMAIN)/g" \
-	 	 -e "s/{{ESC_DOMAIN}}/$(ESC2_DOMAIN)/g" \
+	@sed -e "s/{{DOMAIN}}/$(DOMAIN_ESC)/g" \
+	 	 -e "s/{{DOMAIN_ESC}}/$(DOMAIN_ESC2)/g" \
 	 	 conf.d/pool.conf.template > conf.d/pool.conf
 
 nginx:
