@@ -291,7 +291,7 @@ remove_vhost() {
         if id "$user" &>/dev/null; then
             if confirm "Remove user '$user' (data preserved)?"; then
                 userdel "$user" 2>/dev/null || true
-                echo -e "${RED}[✗] User '$user' removed.${NC}"
+                echo -e "${RED}[✗] User '$user' removed.${NC} Consider deleting its home directory manually. /home/$user/"
             fi
         fi
     else
