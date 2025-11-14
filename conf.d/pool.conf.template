@@ -111,7 +111,7 @@ server {
     # ============================
     location = /robots.txt {
         default_type text/plain;
-        if ($host ~* {{ESC_DOMAIN}}$) {
+        if ($host ~* {{DOMAIN_ESC}}$) {
             return 200 "User-agent: *\nDisallow: /\n";
         }
     }
@@ -120,7 +120,7 @@ server {
     # Common variables
     # ============================
     set $user "";
-    if ($host ~* ^([^.]+){{ESC_DOMAIN}}$) { set $user $1; }
+    if ($host ~* ^([^.]+)\.{{DOMAIN_ESC}}$) { set $user $1; }
     if ($host ~* ^([^.]+)\.localhost$)    { set $user $1; }
     if ($pool_user != "")                 { set $user $pool_user; }
     if ($user = "")                       { set $user nginx; }
