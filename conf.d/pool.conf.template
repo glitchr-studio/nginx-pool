@@ -144,6 +144,7 @@ server {
     # ======================================================
     location ^~ / {
 
+        if (!-d $html_root)  { return 404; }
         if (-f $lock_path) { return 403; }
 
         # (1) userland socket
