@@ -6,61 +6,89 @@
 # Static fallback:  /usr/share/nginx/html
 # ======================================================
 
+# ------------------------------------------------------
+# User mapping
+# ------------------------------------------------------
 map $host $pool_user {
     include /etc/nginx/user.map;
     default "";
 }
 
+# HTTPS flag
 map $http_x_forwarded_proto $fe_https { default off; https on; }
+
+# Debug flag
 map $http_x_pool_debug $pool_debug_allowed {
-    "1"       1;
-    "true"    1;
-    "yes"     1;
-    "on"      1;
-    default   0;
-}
-
-# Debug header maps
-map $pool_debug_allowed $pool_debug_user   { 1 "$user";   default ""; }
-map $pool_debug_allowed $pool_debug_domain { 1 "$domain"; default ""; }
-
-# localhost / external detection
-map $host $is_localhost {
-    ~*\.localhost$ 1;
-    default        0;
-}
-
-# This is overwritten in location / (set to 0 then possibly 1)
-# but NGINX requires 'map' targets to exist ahead of time
-map "$is_localhost$is_locked" $should_lock {
-    "01" 1;   # NOT localhost (0) + locked (1) → LOCK
+    "1" 1; "true" 1; "yes" 1; "on" 1;
     default 0;
 }
 
-# =============================
-#       CDN PROXY CACHE
-# =============================
-proxy_cache_path /var/cache/nginx/edge levels=1:2 keys_zone=EDGE:50m inactive=1h use_temp_path=off;
-proxy_cache_key  "$scheme$host$request_uri";
+map $pool_debug_allowed $pool_debug_user   { 1 "$user";   default ""; }
+map $pool_debug_allowed $pool_debug_domain { 1 "$domain"; default ""; }
+map $pool_debug_allowed $pool_debug_script { 1 "$php_script"; default ""; }
+map $pool_debug_allowed $pool_debug_uri    { 1 "$uri"; default ""; }
+map $pool_debug_allowed $pool_debug_code   { 1 "$code"; default ""; }
 
-# Skip proxy cache on POST/auth
+# ------------------------------------------------------
+# Lock / localhost
+# ------------------------------------------------------
+map $host $is_localhost {
+    ~*\.localhost$ 1;
+    default 0;
+}
+
+map "$is_localhost$is_locked" $should_lock {
+    "01" 1;          # external + locked
+    default 0;
+}
+
+# ------------------------------------------------------
+# Legacy/public PHP logic (LAZY)
+# ------------------------------------------------------
+map $uri $uri_is_php {
+    default 0;
+    "~*\.php$" 1;
+}
+
+map $is_legacy $legacy_flag {
+    default 0;
+    1       1;
+}
+
+map "$legacy_flag$uri_is_php" $php_script_override {
+    "11"     "USE_URI";
+    default  "";
+}
+
+map $php_script_override $php_script {
+    default   /index.php;
+    "USE_URI" $uri;
+}
+
+# ------------------------------------------------------
+# Static file detection
+# ------------------------------------------------------
+map $uri $is_static {
+    "~*\.php$"      0;
+    "~*\.[^/]+$"    1;
+    default         0;
+}
+
+# ------------------------------------------------------
+# CDN Proxy Cache
+# ------------------------------------------------------
+proxy_cache_path /var/cache/nginx/edge levels=1:2 keys_zone=EDGE:50m inactive=1h use_temp_path=off;
+proxy_cache_key "$scheme$host$request_uri";
+
 map $request_method $skip_proxy_method { default 0; POST 1; }
 map "$skip_proxy_method$http_authorization" $skip_proxy_cache { default 0; ~1 1; }
 
-# Disable CDN cache in debug mode
-map $pool_debug_allowed $edge_cache_enable {
-    1 "";         # disable
-    default "EDGE";
-}
+map $pool_debug_allowed $edge_cache_enable { 1 ""; default "EDGE"; }
+map $pool_debug_allowed $edge_cache_bypass { 1 1; default 0; }
 
-map $pool_debug_allowed $edge_cache_bypass {
-    1 1;          # bypass
-    default 0;
-}
-
-# =============================
-#     FASTCGI MICRO-CACHE
-# =============================
+# ------------------------------------------------------
+# FastCGI micro-cache
+# ------------------------------------------------------
 map $request_method $skip_cache_method { default 0; POST 1; }
 map $http_authorization $skip_cache_auth { default 0; ~.+ 1; }
 map $http_cookie $skip_cache_cookie { default 0; ~*(PHPSESSID|XDEBUG_SESSION|_SESSION) 1; }
@@ -74,232 +102,213 @@ map "$skip_cache_method$skip_cache_auth$skip_cache_cookie$skip_cache_arg" $skip_
 fastcgi_cache_path /var/cache/nginx/fastcgi levels=1:2 keys_zone=FCGI:64m inactive=2m max_size=2g;
 fastcgi_cache_key "$scheme$request_method$host$request_uri";
 
-# Disable FCGI cache when debug
-map $pool_debug_allowed $fcgi_cache_enable {
-    1 "";        # no cache
-    default "FCGI";
-}
+map $pool_debug_allowed $fcgi_cache_enable { 1 ""; default "FCGI"; }
+map $pool_debug_allowed $fcgi_cache_bypass { 1 1; default 0; }
 
-map $pool_debug_allowed $fcgi_cache_bypass {
-    1 1;
-    default 0;
-}
+# ------------------------------------------------------
+# WebSocket helper
+# ------------------------------------------------------
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
 
-# =============================
-#  Static extension detection
-# =============================
-map $uri $perhaps_static {
-    "~*\.(png|jpe?g|gif|bmp|webp|webmanifest|ico|svg|css|js|mjs|json|map|woff2?|ttf|eot|pdf|zip|tar|gz|7z|mp4|webm|ogg)$" 1;
-    default 0;
-}
-
+# ======================================================
+# HTTP → HTTPS
+# ======================================================
 server {
     listen 80 default_server;
     server_name _;
     return 301 https://$host$request_uri;
 }
 
+# ======================================================
+# Main HTTPS / HTTP3 server
+# ======================================================
 server {
+
     listen 443 ssl default_server;
     listen 443 quic reuseport;
     http2 on;
 
     server_name _;
+    server_tokens off;
 
-    ssl_certificate     /etc/letsencrypt/live/{{DOMAIN}}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/{{DOMAIN}}/privkey.pem;
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/letsencrypt;
+    # Normalize forwarded proto
+    if ($http_x_forwarded_proto = "http") {
+        set $http_x_forwarded_proto "https";
     }
+
+    proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+
+    ssl_certificate     /etc/letsencrypt/live/pool.glitchr.dev/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/pool.glitchr.dev/privkey.pem;
+
+    client_max_body_size 128M;
+    client_header_buffer_size 32k;
+    large_client_header_buffers 8 128k;
+
+    # Security + HTTP3
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-Permitted-Cross-Domain-Policies "none" always;
+    add_header Content-Security-Policy "upgrade-insecure-requests";
+
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade    $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
 
     access_log /var/log/nginx/pool_access.log;
     error_log  /var/log/nginx/pool_error.log;
 
-    add_header Strict-Transport-Security "max-age=31536000" always;
-    add_header X-Content-Type-Options nosniff;
-    add_header X-Frame-Options SAMEORIGIN;
+    # ACME
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+    }
 
-    # ============================
     # robots.txt
-    # ============================
     location = /robots.txt {
         default_type text/plain;
-        if ($host ~* {{DOMAIN_ESC}}$) {
+        if ($host ~* pool\.glitchr\.dev$) {
             return 200 "User-agent: *\nDisallow: /\n";
         }
     }
 
-    # ============================
-    # Common variables
-    # ============================
+    # -------------------------------------------------
+    # Resolve user/domain and filesystem roots
+    # -------------------------------------------------
     set $user "";
-    if ($host ~* ^([^.]+)\.{{DOMAIN_ESC}}$) { set $user $1; }
-    if ($host ~* ^([^.]+)\.localhost$)    { set $user $1; }
-    if ($pool_user != "")                 { set $user $pool_user; }
-    if ($user = "")                       { set $user nginx; }
+    if ($host ~* ^([^.]+)\.pool\.glitchr\.dev$) { set $user $1; }
+    if ($host ~* ^([^.]+)\.localhost$)          { set $user $1; }
+    if ($pool_user != "")                       { set $user $pool_user; }
+    if ($user = "")                             { set $user nginx; }
 
     if ($uri ~* ^/([^/]+)/?) { set $domain $1; }
     if ($user = "$pool_user") { set $domain $host; }
 
     set $userland /home/$user/www/$domain;
-    set $nginx    /home/nginx/www/localhost;
-
     set $lock_path $userland.lock;
     set $sock_path $userland.sock;
-    set $php_root  $userland;
-    set $html_root $userland;
+
+    set $webroot $userland;
 
     add_header X-Pool-User   $pool_debug_user   always;
     add_header X-Pool-Domain $pool_debug_domain always;
-        
+    add_header X-Pool-Script $pool_debug_script always;
+    add_header X-Pool-Uri    $pool_debug_uri    always;
+    add_header X-Pool-Code   $pool_debug_code   always;
+
+    # ======================================================
+    # NGINX DEFAULT
+    # ======================================================
+    error_page 589 = @nginx_default;
+    location @nginx_default {
+
+        set $code 589;
+        root /usr/share/nginx/html;
+        try_files $uri /index.html =404;
+    }
+    
     # ======================================================
     # DISPATCHER
     # ======================================================
     location ^~ / {
 
-        if (!-d $html_root)  { return 404; }
+        set $code 0;
+        if (!-d $webroot) { return 594; }
 
-        # (0) check hardlock
+        # Lock
         set $is_locked 0;
         if (-f $lock_path) { set $is_locked 1; }
         if ($should_lock = 1) { return 403; }
 
-        # (1) userland socket
+        # Socket takes priority
         if (-e $sock_path) { return 590; }
 
-        # Normalize html_root BEFORE static handling
-        if (-d $html_root/public)  { set $html_root $html_root/public; }
-        if (-d $html_root/current) { set $html_root $html_root/current; }
+        # Recompute legacy mode (runtime) — lazy maps will re-evaluate
+        set $is_legacy 1;
+        if (-d $webroot/current) { set $webroot $webroot/current; }
+        if (-d $webroot/public)  {
+            set $webroot $webroot/public;
+            set $is_legacy 0;
+        }
 
-        # ---------- CDN cache on frontend ----------
-        proxy_cache          $edge_cache_enable;
-        proxy_cache_bypass   $edge_cache_bypass;
-        proxy_no_cache       $edge_cache_bypass;
-        add_header X-Edge-Cache $upstream_cache_status always;
+        proxy_cache        $edge_cache_enable;
+        proxy_cache_bypass $edge_cache_bypass;
+        proxy_no_cache     $edge_cache_bypass;
 
-        # (2) Asset files
-        if ($perhaps_static = 1) { return 591; }
-
-        # (3) PHP index pages
-        if (-f $php_root/current/index.php)   { return 592; }
-        if (-f $php_root/public/index.php)    { return 592; }
-        if (-f $php_root/index.php)           { return 592; }
-
-        # (4) HTML index pages
-        if (-f $html_root/current/index.html) { return 593; }
-        if (-f $html_root/public/index.html)  { return 593; }
-        if (-f $html_root/index.html)         { return 593; }
-
-        # (5) Fallback to nginx default
-        set $php_root  $nginx;
-        set $html_root $nginx;
-
-        if (-d $html_root/public)  { set $html_root $html_root/public; }
-        if (-d $html_root/current) { set $html_root $html_root/current; }
-
-        if ($perhaps_static = 1) { return 591; }
-        if (-f $php_root/current/index.php)   { return 592; }
-        if (-f $php_root/public/index.php)    { return 592; }
-        if (-f $php_root/index.php)           { return 592; }
-        if (-f $html_root/current/index.html) { return 593; }
-        if (-f $html_root/public/index.html)  { return 593; }
-        if (-f $html_root/index.html)         { return 593; }
-
-        # (6) global nginx fallback
-        if (-d /usr/share/nginx/html) { return 594; }
+        if ($is_static = 1) { return 591; }
+        if (-f $webroot$php_script) { return 592; }
+        if (-f $webroot/index.html) { return 593; }
 
         return 404;
     }
 
     # ======================================================
-    # USER SOCKET
+    # SOCKET FALLBACK
     # ======================================================
     error_page 590 = @sock_fallback;
     location @sock_fallback {
+        set $code 590;
         proxy_pass http://unix:$sock_path:;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_intercept_errors on;
-        error_page 502 503 504 = @php_fallback;
     }
 
     # ======================================================
-    # STATIC RESOLVER
+    # STATIC FALLBACK
     # ======================================================
     error_page 591 = @asset_resolver;
     location @asset_resolver {
-        root $html_root;
-        try_files $uri @php_fallback;
+
+        set $code 591;
+        root $webroot;
+        try_files $uri =404;
     }
 
     # ======================================================
-    # PHP
+    # PHP FALLBACK
     # ======================================================
     error_page 592 = @php_fallback;
     location @php_fallback {
 
-        if (-d $php_root/public)  { set $php_root $php_root/public; }
-        if (-d $php_root/current) { set $php_root $php_root/current; }
-
+        set $code 592;
         include fastcgi_params;
 
-        # ------ FASTCGI MICRO-CACHE ------
         fastcgi_cache         $fcgi_cache_enable;
         fastcgi_cache_bypass  $fcgi_cache_bypass;
         fastcgi_no_cache      $fcgi_cache_bypass;
+        fastcgi_cache_valid   200 1s;
+        fastcgi_cache_valid   301 302 10s;
+        fastcgi_cache_valid   any 5s;
 
-        fastcgi_cache_valid      200 1s;
-        fastcgi_cache_valid      301 302 10s;
-        fastcgi_cache_valid      any 5s;
-        fastcgi_cache_revalidate on;
-        fastcgi_cache_use_stale  error timeout invalid_header updating http_500 http_503;
-        fastcgi_cache_lock       on;
-        fastcgi_cache_methods    GET HEAD;
-        fastcgi_cache_min_uses   1;
-        fastcgi_ignore_headers   Cache-Control Expires Set-Cookie;
-
-        add_header X-Cache $upstream_cache_status always;
-        # ---------------------------------
-
-        fastcgi_param SCRIPT_FILENAME $php_root/index.php;
-        fastcgi_param SCRIPT_NAME     /index.php;
-        fastcgi_param DOCUMENT_ROOT   $php_root;
+        fastcgi_param SCRIPT_FILENAME $webroot$php_script;
+        fastcgi_param SCRIPT_NAME     $php_script;
+        fastcgi_param DOCUMENT_ROOT   $webroot;
 
         fastcgi_pass unix:/run/php/php-fpm.sock;
-        fastcgi_intercept_errors on;
-
-        fastcgi_param HTTPS                  $fe_https;
-        fastcgi_param HTTP_X_FORWARDED_PROTO $http_x_forwarded_proto;
-        fastcgi_param SERVER_PORT            $server_port;
-
-        fastcgi_buffers 16 16k;
-        fastcgi_buffer_size 32k;
-        fastcgi_connect_timeout 5s;
-        fastcgi_send_timeout 30s;
-        fastcgi_read_timeout 120s;
-
-        error_page 502 503 504 = @html_fallback;
     }
-    
+
     # ======================================================
-    # HTML
+    # HTML FALLBACK
     # ======================================================
     error_page 593 = @html_fallback;
     location @html_fallback {
-        if (-d $html_root/public)  { set $html_root $html_root/public; }
-        if (-d $html_root/current) { set $html_root $html_root/current; }
-        root $html_root;
-        try_files /index.html =404;
+        set $code 593;
+        root $webroot;
+        try_files $uri /index.html @nginx_default;
     }
 
     # ======================================================
-    # GLOBAL STATIC FALLBACK
+    # NGINX FALLBACK
     # ======================================================
-    error_page 594 = @static_fallback;
-    location @static_fallback {
-        root /usr/share/nginx/html;
-        try_files /index.html =404;
+    error_page 594 = @nginx_fallback;
+    location @nginx_fallback {
+
+        set $code 594;
+        root /home/nginx/www/localhost;
+        try_files $uri /index.html @nginx_default;
     }
 }
