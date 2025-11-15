@@ -11,6 +11,7 @@ map $host $pool_user {
     default "";
 }
 
+map $http_x_forwarded_proto $fe_https { default off; https on; }
 map $http_x_pool_debug $pool_debug_allowed {
     "1"       1;
     "true"    1;
@@ -22,6 +23,19 @@ map $http_x_pool_debug $pool_debug_allowed {
 # Debug header maps
 map $pool_debug_allowed $pool_debug_user   { 1 "$user";   default ""; }
 map $pool_debug_allowed $pool_debug_domain { 1 "$domain"; default ""; }
+
+# localhost / external detection
+map $host $is_localhost {
+    ~*\.localhost$ 1;
+    default        0;
+}
+
+# This is overwritten in location / (set to 0 then possibly 1)
+# but NGINX requires 'map' targets to exist ahead of time
+map "$is_localhost$is_locked" $should_lock {
+    "01" 1;   # NOT localhost (0) + locked (1) → LOCK
+    default 0;
+}
 
 # =============================
 #       CDN PROXY CACHE
@@ -138,14 +152,18 @@ server {
 
     add_header X-Pool-User   $pool_debug_user   always;
     add_header X-Pool-Domain $pool_debug_domain always;
-
+        
     # ======================================================
     # DISPATCHER
     # ======================================================
     location ^~ / {
 
         if (!-d $html_root)  { return 404; }
-        if (-f $lock_path) { return 403; }
+
+        # (0) check hardlock
+        set $is_locked 0;
+        if (-f $lock_path) { set $is_locked 1; }
+        if ($should_lock = 1) { return 403; }
 
         # (1) userland socket
         if (-e $sock_path) { return 590; }
@@ -251,7 +269,16 @@ server {
 
         fastcgi_pass unix:/run/php/php-fpm.sock;
         fastcgi_intercept_errors on;
-        fastcgi_read_timeout 60s;
+
+        fastcgi_param HTTPS                  $fe_https;
+        fastcgi_param HTTP_X_FORWARDED_PROTO $http_x_forwarded_proto;
+        fastcgi_param SERVER_PORT            $server_port;
+
+        fastcgi_buffers 16 16k;
+        fastcgi_buffer_size 32k;
+        fastcgi_connect_timeout 5s;
+        fastcgi_send_timeout 30s;
+        fastcgi_read_timeout 120s;
 
         error_page 502 503 504 = @html_fallback;
     }
