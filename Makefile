@@ -24,7 +24,7 @@ build-config:
 nginx:
 	@curl -fsSL https://nginx.org/keys/nginx_signing.key   | sudo gpg --dearmor -o /usr/share/keyrings/nginx-keyring.gpg
 	@echo -e "deb [signed-by=/usr/share/keyrings/nginx-keyring.gpg]\n http://nginx.org/packages/mainline/debian bookworm nginx" | tee /etc/apt/sources.list.d/nginx-mainline.list
-	@apt install nginx python3-certbot-nginx nginx-module-brotli
+	@apt install nginx python3-certbot-nginx
 	@cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak || true
 	@cp nginx.conf /etc/nginx/
 
@@ -43,5 +43,6 @@ conf: build-config
 	@touch /etc/nginx/user_map.conf
 	@nginx -t
 	@systemctl restart nginx
+
 reload:
 	@systemctl restart nginx
