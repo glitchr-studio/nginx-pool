@@ -29,6 +29,204 @@ map $pool_debug_allowed $pool_debug_script { 1 "$php_script"; default ""; }
 map $pool_debug_allowed $pool_debug_uri    { 1 "$uri"; default ""; }
 map $pool_debug_allowed $pool_debug_code   { 1 "$code"; default ""; }
 
+# ======================================================
+# Unified Dynamic Error System (418 + 402 + 40x + 50x)
+# ======================================================
+map $uri $forced_test_code {
+    default "";
+    "~^/@([1-5][1-9]{2})$" $1;
+}
+
+map $forced_test_code $effective_status {
+    default $status;
+    ~^[0-9]+$ $forced_test_code;
+}
+
+map $effective_status $error_emoji_final {
+    # 1xx
+    100 "⏳"; 101 "🔄"; 102 "⚙️"; 103 "📬";
+
+    # 2xx
+    200 "✔️"; 201 "🆕"; 202 "⌛"; 203 "ℹ️"; 204 "🚫"; 205 "🔄"; 206 "📦"; 226 "⚡";
+
+    # 3xx
+    300 "➡️"; 301 "🏠"; 302 "🔁"; 303 "🧭"; 304 "📦"; 307 "↪️"; 308 "↩️";
+
+    # 4xx
+    400 "⚠️"; 401 "🔐"; 402 "💳"; 403 "⛔"; 404 "🔍"; 405 "🚫"; 406 "⚙️"; 407 "🧱";
+    408 "⌛"; 409 "⚔️"; 410 "🗑️"; 411 "📏"; 412 "❗"; 413 "📦"; 414 "🔗";
+    415 "🎞️"; 416 "📏"; 417 "🤷"; 418 "🫖"; 421 "🎯"; 422 "✍️"; 423 "🔒";
+    424 "🚫"; 425 "⏱️"; 426 "⬆️"; 428 "📜"; 429 "🐌"; 431 "📄"; 451 "⚖️";
+
+    # 5xx
+    500 "💥"; 501 "🛠️"; 502 "🔌"; 503 "🚧"; 504 "⏱️"; 505 "📼";
+    506 "🔄"; 507 "💾"; 508 "🔁"; 510 "➕"; 511 "🌐";
+
+    default "❓";
+}
+
+map $effective_status $error_class_final {
+    ~^1 "Informational Response";
+    ~^2 "Success";
+    ~^3 "Redirection";
+    ~^4 "Client Error";
+    ~^5 "Server Error";
+    default "HTTP";
+}
+
+map $effective_status $error_title_final {
+
+    # --- 1xx ---
+    100 "Continue";
+    101 "Switching Protocols";
+    102 "Processing";
+    103 "Early Hints";
+
+    # --- 2xx ---
+    200 "OK";
+    201 "Created";
+    202 "Accepted";
+    203 "Non-Authoritative Information";
+    204 "No Content";
+    205 "Reset Content";
+    206 "Partial Content";
+    207 "Multi-Status";
+    208 "Already Reported";
+    226 "IM Used";
+
+    # --- 3xx ---
+    300 "Multiple Choices";
+    301 "Moved Permanently";
+    302 "Found";
+    303 "See Other";
+    304 "Not Modified";
+    307 "Temporary Redirect";
+    308 "Permanent Redirect";
+
+    # --- 4xx ---
+    400 "Bad Request";
+    401 "Unauthorized";
+    402 "Payment Required";
+    403 "Forbidden";
+    404 "Not Found";
+    405 "Method Not Allowed";
+    406 "Not Acceptable";
+    407 "Proxy Authentication Required";
+    408 "Request Timeout";
+    409 "Conflict";
+    410 "Gone";
+    411 "Length Required";
+    412 "Precondition Failed";
+    413 "Payload Too Large";
+    414 "URI Too Long";
+    415 "Unsupported Media Type";
+    416 "Range Not Satisfiable";
+    417 "Expectation Failed";
+    418 "I'm a Teapot";
+    421 "Misdirected Request";
+    422 "Unprocessable Content";
+    423 "Locked";
+    424 "Failed Dependency";
+    425 "Too Early";
+    426 "Upgrade Required";
+    428 "Precondition Required";
+    429 "Too Many Requests";
+    431 "Request Header Fields Too Large";
+    451 "Unavailable For Legal Reasons";
+
+    # --- 5xx ---
+    500 "Internal Server Error";
+    501 "Not Implemented";
+    502 "Bad Gateway";
+    503 "Service Unavailable";
+    504 "Gateway Timeout";
+    505 "HTTP Version Not Supported";
+    506 "Variant Also Negotiates";
+    507 "Insufficient Storage";
+    508 "Loop Detected";
+    510 "Not Extended";
+    511 "Network Authentication Required";
+
+    default "Status";
+}
+
+map $effective_status $error_message_final {
+
+    # --- 1xx ---
+    100 "The server has received your request and is currently dusting off its processing gears. Please hold while it prepares for the next exciting step of this HTTP journey.";
+    101 "The server agrees to switch protocols. It is now putting on a different hat and adjusting its tie to speak the protocol you requested.";
+    102 "Processing has begun — the server is juggling tasks, flipping bits, and consulting its internal librarians. Progress is happening, even if the results aren't quite ready to show off.";
+    103 "Early hints are being sent. The server would like you to know it's working very hard and hopes this preview sparks joy.";
+
+    # --- 2xx ---
+    200 "Success! Everything worked perfectly. The server smiled, handed over your requested resource, and hopes you appreciate its impeccable service.";
+    201 "Your resource has been created. It now exists proudly in the digital landscape, freshly constructed and ready for further adventures.";
+    202 "Your request has been accepted for processing, but the results are still brewing somewhere in the background. The server promises it’s on the case.";
+    203 "Non-authoritative information returned. The server retrieved the data, but it came from an outside source whose reliability may or may not involve optimism.";
+    204 "Success — with absolutely nothing to return. The server completed your request silently and respectfully, like a ninja delivering results without leaving evidence.";
+    205 "The server successfully processed your request and politely suggests that your user agent reset its view. A gentle tap on the refresh button of life.";
+    206 "Partial content delivered. The server sent the portion you asked for and assumes you know what you're doing, even if it's downloading a file piece by piece like it's 1999.";
+    207 "Multi-status response. The server is handing you a small report card summarizing a variety of outcomes — some good, some questionable, all accounted for.";
+    208 "Already reported. The server already mentioned this resource, so it's not repeating itself. Efficiency is key.";
+    226 "IM Used. The server applied a cool transformation and is pleased to present data that may now be slightly more optimized or magical.";
+
+    # --- 3xx ---
+    300 "Multiple choices available. The server presents you with a small buffet of possibilities and encourages you to follow your heart.";
+    301 "This resource has permanently moved. The server advises updating your bookmarks, forwarding addresses, and maybe notifying relatives.";
+    302 "This resource has temporarily moved. The server promises it will be back at its old place soon — probably — but for now, it’s over *there*.";
+    303 "See Other. The server wants you to look at a different resource instead, like a polite librarian redirecting you to the correct bookshelf.";
+    304 "Not modified. The server checked thoroughly and concluded nothing has changed since last time. Why send it again? Efficiency is beauty.";
+    305 "Use Proxy. The server kindly instructs you to go through a proxy, as if it's pointing you toward a friend who ‘knows a guy’.";
+    306 "Unused. This code once had purpose, ambition, and dreams — but now it has retired into legend. The server salutes it.";
+    307 "Temporary redirect. The server insists you repeat the exact same method at the new location. Consistency matters.";
+    308 "Permanent redirect. The server announces the move is final and encourages you to update everything accordingly, including old bookmarks buried deep in forgotten browser settings.";
+
+    # --- 4xx ---
+    400 "Your request was malformed or incomplete. It arrived like a jigsaw puzzle with half the pieces missing, the instructions written in a forgotten language, and a note saying 'good luck'. The server tried to make sense of it but eventually gave up for the sake of its own sanity.";
+    401 "Authentication is required. To proceed, you must provide credentials, tokens, passwords, keycards, or possibly a magic incantation. Without proper identification, the server is reluctant to let strangers wander its corridors.";
+    402 "Payment is required to access this resource. Unfortunately, the server currently accepts only rare digital artifacts such as cookies, session tokens, and possibly the tears of developers debugging production systems. Monetary payments are temporarily unavailable.";
+    403 "Access to this resource is forbidden. The server has checked its rulebook, its firewall, the sacred scrolls of access control, and even consulted a wise old daemon. All agree that you shall not pass — at least not without proper authorization.";
+    404 "The page you're looking for could not be found. It may have been moved, deleted, kidnapped by gremlins, replaced by a decoy, or simply never existed in this timeline. The server conducted a search party but found only tumbleweeds blowing quietly in the digital wind.";
+    405 "This HTTP method is not allowed. The server stared at your request like a barista receiving an order for 'boiled ice'. It is technically possible, perhaps, but absolutely not happening here. Try a method that the server actually understands.";
+    406 "The server cannot provide a response in any format you claim to accept. It attempted JSON, XML, YAML, Morse code, interpretive dance, and an offering to the machine spirits — nothing met your standards.";
+    407 "Proxy authentication required. Somewhere between you and the destination stands a gatekeeper proxy who demands tribute. Until you satisfy its request, the server is unable to escort you any further.";
+    408 "Your request took too long. The server waited patiently, hummed a tune, made a cup of tea, checked its logs, and eventually decided the connection was abandoned. If you return, the server promises it will try again with renewed optimism.";
+    409 "A conflict occurred. Two competing realities tried to exist at once — your request and the server's current state — and the universe politely declined to merge them.";
+    410 "This resource used to exist, but has now journeyed to the great digital beyond. It is gone with intention, purpose, and finality. Not archived, not hidden, not under maintenance — simply gone, like an old web page retiring to a server farm in the countryside.";
+    411 "Length required. The server needs to know precisely how long your message is. Guessing is improper, impolite, and strictly against the ancient rites of HTTP.";
+    412 "A precondition for this request was not met. The server checked the conditions you provided, shook its head solemnly, and decided the stars were not aligned.";
+    413 "Your payload is too large. It arrived so massive that the server briefly considered starting a fitness program to handle it.";
+    414 "The requested URI is too long. It trailed across the server logs like a dragon's tail, sprawling far beyond what any reasonable URL should.";
+    415 "Unsupported media type. The server examined the format you sent and concluded it lacks the training, codecs, or existential fortitude to process it.";
+    416 "The range you requested makes no mathematical sense. The server double-checked the numbers and confirmed that reality itself rejects them.";    417 "Expectation failed. The server received your 'Expect' header, weighed its hopes and dreams, and decided it simply could not live up to such expectations.";
+    418 "This server cannot brew coffee because it is, without a shadow of a doubt, an actual teapot. RFC 2324 clearly states that any attempt to request coffee from a teapot is doomed to fail. Please respect the ancient and sacred tradition of tea-based protocols.";
+    421 "This request was sent to the wrong server. It politely informs you that it is not the chosen one you seek.";
+    422 "The server understood your request perfectly, but the content itself was too confusing, contradictory, or existentially disturbing to process.";
+    423 "This resource is locked. The server jiggled the handle, knocked politely, and even whispered 'hello?' — but the door remains firmly shut.";
+    424 "A required dependency failed, and so the server cannot proceed. Like a domino missing from the chain, everything stops here.";
+    425 "The server refuses to process this request early due to replay concerns. It adopts a 'better safe than sorry' policy — especially with time-traveling requests.";
+    426 "Upgrade required. The server would love to help, but it demands a better, shinier, more modern protocol before it even considers cooperating.";
+    428 "A required precondition was missing. The server insists you state your terms clearly before it participates in anything serious.";
+    429 "Too many requests. The server noticed an enthusiastic flood of traffic coming your way. While flattered by the attention, it kindly requests you to slow down, breathe deeply, and remember that even machines enjoy a moment of peace now and then.";
+    431 "Your request headers were so large and numerous that the server briefly felt overwhelmed and asked them to take a step back and reorganize.";
+    451 "This resource is unavailable for legal reasons. The server is following official decrees, regulations, or ominous letters signed with unreadable government acronyms.";
+
+    # --- 5xx ---
+    500 "The server encountered an unexpected internal error. Something somewhere misbehaved, tripped, exploded, vanished, or returned a value so strange that NGINX paused to question the nature of reality. Rest assured, a tiny digital gnome has been dispatched to investigate.";
+    501 "This functionality is not implemented. It might be planned for the future, or it might exist only in the dreams of ambitious developers who swear they'll finish it 'after this sprint'. For now, the server politely declines to attempt the impossible.";
+    502 "Bad gateway. The upstream server returned a response that made so little sense that NGINX briefly wondered if it had contacted the right machine or accidentally reached an alternate universe. The communication has been retried and diplomatic channels are now open.";
+    503 "Service temporarily unavailable. The server might be overloaded, undergoing maintenance, or has simply taken a brief nap to recover from the existential dread of handling production workloads. Please try again later once the electrons have finished reorganizing themselves.";
+    504 "The gateway timed out while waiting for a response. The upstream service took longer than acceptable, possibly due to heavy processing, deep contemplation, or an unexpected coffee break. NGINX waited respectfully but eventually had to move on with its life.";
+    505 "HTTP Version Not Supported. The server tried to communicate but realized the protocol you're speaking belongs either to a distant past or a speculative sci-fi future.";
+    506 "Variant Also Negotiates. The server became confused while negotiating content with itself, which resulted in an infinite philosophical loop.";
+    507 "Insufficient Storage. The server has run out of room for your request. It suggests decluttering old logs, memes, or temporary files.";
+    508 "Loop Detected. The server found itself stuck in a recursive loop and refused to continue before losing its sanity entirely.";
+    510 "Not Extended. The request requires additional extensions that the server has not yet mastered. More training modules are needed.";
+    511 "Network Authentication Required. Before continuing, the server needs you to authenticate on the network itself — a cosmic handoff between layers.";
+
+    default "An unexpected response was returned. This status does not have a dedicated message, but the server handled it with dignity and hopes everything is still functioning correctly on your side of the internet.";
+}
+
 # ------------------------------------------------------
 # Lock / localhost
 # ------------------------------------------------------
@@ -70,7 +268,7 @@ map $php_script_override $php_script {
 # ------------------------------------------------------
 map $uri $is_static {
     "~*\.php$"      0;
-    "~*\.[^/]+$"    1;
+    "~*\.(css|js|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm|ogg|json|txt|xml)$" 1;
     default         0;
 }
 
@@ -178,6 +376,17 @@ server {
         }
     }
 
+    # direct error access
+    location ^~ /@ {
+
+        if ($uri ~ "^/@([1-5][0-9]{2})$") {
+            set $forced_test_code $1;
+            return 418;
+        }
+
+        return 404;
+    }
+
     # -------------------------------------------------
     # Resolve user/domain and filesystem roots
     # -------------------------------------------------
@@ -190,11 +399,11 @@ server {
     if ($uri ~* ^/([^/]+)/?) { set $domain $1; }
     if ($user = "$pool_user") { set $domain $host; }
 
-    set $userland /home/$user/www/$domain;
-    set $lock_path $userland.lock;
-    set $sock_path $userland.sock;
+    set $userland /home/$user/www;
 
-    set $webroot $userland;
+    set $webroot $userland/$domain;
+    set $locker $webroot.lock;
+    set $socket $webroot.sock;
 
     add_header X-Pool-User   $pool_debug_user   always;
     add_header X-Pool-Domain $pool_debug_domain always;
@@ -210,6 +419,7 @@ server {
 
         set $code 589;
         root /usr/share/nginx/html;
+        
         try_files $uri /index.html =404;
     }
     
@@ -219,15 +429,16 @@ server {
     location ^~ / {
 
         set $code 0;
-        if (!-d $webroot) { return 594; }
+        if (!-d $userland) { return 418; }
+        if (!-d $webroot) { return 404; }
 
         # Lock
         set $is_locked 0;
-        if (-f $lock_path) { set $is_locked 1; }
+        if (-f $locker) { set $is_locked 1; }
         if ($should_lock = 1) { return 403; }
 
         # Socket takes priority
-        if (-e $sock_path) { return 590; }
+        if (-e $socket) { return 590; }
 
         # Recompute legacy mode (runtime) — lazy maps will re-evaluate
         set $is_legacy 1;
@@ -245,7 +456,7 @@ server {
         if (-f $webroot$php_script) { return 592; }
         if (-f $webroot/index.html) { return 593; }
 
-        return 404;
+        return 594;
     }
 
     # ======================================================
@@ -254,7 +465,7 @@ server {
     error_page 590 = @sock_fallback;
     location @sock_fallback {
         set $code 590;
-        proxy_pass http://unix:$sock_path:;
+        proxy_pass http://unix:$socket:;
     }
 
     # ======================================================
@@ -265,7 +476,8 @@ server {
 
         set $code 591;
         root $webroot;
-        try_files $uri =404;
+
+        try_files $uri @php_fallback;
     }
 
     # ======================================================
@@ -306,9 +518,89 @@ server {
     # ======================================================
     error_page 594 = @nginx_fallback;
     location @nginx_fallback {
-
         set $code 594;
         root /home/nginx/www/localhost;
+
+        sub_filter_once off;
+        sub_filter '%%WEBROOT%%' '$webroot';
+        sub_filter '%%DOMAIN%%' '$domain';
+
         try_files $uri /index.html @nginx_default;
+    }
+
+    # ======================================================
+    # Unified Dynamic Error Template Loader
+    # ======================================================
+
+    # All 30x (preserve status)
+    error_page 300 =300 @error;
+    error_page 301 =301 @error;
+    error_page 302 =302 @error;
+    error_page 303 =303 @error;
+    error_page 304 =304 @error;
+    error_page 307 =307 @error;
+    error_page 308 =308 @error;
+    
+    # All 40x (preserve status)
+    error_page 400 =400 @error;
+    error_page 401 =401 @error;
+    error_page 402 =402 @error;
+    error_page 403 =403 @error;
+    error_page 404 =404 @error;
+    error_page 405 =405 @error;
+    error_page 406 =406 @error;
+    error_page 407 =407 @error;
+    error_page 408 =408 @error;
+    error_page 409 =409 @error;
+    error_page 410 =410 @error;
+    error_page 411 =411 @error;
+    error_page 412 =412 @error;
+    error_page 413 =413 @error;
+    error_page 414 =414 @error;
+    error_page 415 =415 @error;
+    error_page 416 =416 @error;
+    error_page 417 =417 @error;
+    error_page 418 =418 @error;
+    error_page 421 =421 @error;
+    error_page 422 =422 @error;
+    error_page 423 =423 @error;
+    error_page 424 =424 @error;
+    error_page 425 =425 @error;
+    error_page 426 =426 @error;
+    error_page 428 =428 @error;
+    error_page 429 =429 @error;
+    error_page 431 =431 @error;
+    error_page 451 =451 @error;
+
+    # All 50x (preserve status)
+    error_page 500 =500 @error;
+    error_page 501 =501 @error;
+    error_page 502 =502 @error;
+    error_page 503 =503 @error;
+    error_page 504 =504 @error;
+    error_page 505 =505 @error;
+    error_page 506 =506 @error;
+    error_page 507 =507 @error;
+    error_page 508 =508 @error;
+    error_page 510 =510 @error;
+    error_page 511 =511 @error;
+
+    location @error {
+
+        internal;
+        root /home/nginx/www/localhost;
+
+        try_files /error.html =500;
+
+        sub_filter_once off;
+        sub_filter '%%STATUS%%'  '$effective_status';
+        sub_filter '%%CLASS%%'   '$error_class_final';
+        sub_filter '%%TITLE%%'   '$error_title_final';
+        sub_filter '%%EMOJI%%'   '$error_emoji_final';
+        sub_filter '%%MESSAGE%%' '$error_message_final';
+
+        default_type text/html;
+        add_header X-Content-Type-Options "nosniff";
+        add_header Cache-Control "no-cache";
     }
 }
