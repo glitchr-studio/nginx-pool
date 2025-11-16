@@ -469,7 +469,8 @@ EOF
     echo -e "    ${GRAY}Socket path:  ${CYAN}$sock${NC}"
     echo -e "    ${GRAY}Lock file:    ${CYAN}${base}.lock${NC}"
     echo -e "    ${GRAY}URLs:${NC}"
-    echo -e "      ${BLUE}https://$user.$MASTER:$PORT/$domain/${NC}"
+    local EFFECTIVE_PORT=$([[ $PORT == 80 || $PORT == 443 ]] && echo "" || echo ":$PORT")
+    echo -e "      ${BLUE}https://$user.$MASTER${EFFECTIVE_PORT}/$domain/${NC}"
 
     lock_vhost "$user" "$domain" > /dev/null
     fix_acl "$user" "$domain" > /dev/null
@@ -657,7 +658,8 @@ list_vhosts() {
             [[ -f "$lock" ]] && status="${RED}LOCKED${NC}" || status="${GREEN}ACTIVE${NC}"
 
             if [[ "$show_urls" == "true" ]]; then
-                output="https://$user.$MASTER:$PORT/$domain/"
+                local EFFECTIVE_PORT=$([[ $PORT == 80 || $PORT == 443 ]] && echo "" || echo ":$PORT")
+                output="https://$user.$MASTER${EFFECTIVE_PORT}/$domain/"
             else
                 output="$domain_dir"
             fi
