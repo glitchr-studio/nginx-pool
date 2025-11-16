@@ -202,7 +202,7 @@ map $effective_status $error_message_final {
     418 "This server cannot brew coffee because it is, without a shadow of a doubt, an actual teapot. RFC 2324 clearly states that any attempt to request coffee from a teapot is doomed to fail. Please respect the ancient and sacred tradition of tea-based protocols.";
     421 "This request was sent to the wrong server. It politely informs you that it is not the chosen one you seek.";
     422 "The server understood your request perfectly, but the content itself was too confusing, contradictory, or existentially disturbing to process.";
-    423 "This resource is locked. The server jiggled the handle, knocked politely, and even whispered 'hello?' — but the door remains firmly shut.";
+    423 "This resource is locked. The server jiggled the handle, knocked politely, and even whispered “hello?” — but the door remains firmly shut. The key may be lying beside your project’s web root. Removing it may let the server open the door again.";
     424 "A required dependency failed, and so the server cannot proceed. Like a domino missing from the chain, everything stops here.";
     425 "The server refuses to process this request early due to replay concerns. It adopts a 'better safe than sorry' policy — especially with time-traveling requests.";
     426 "Upgrade required. The server would love to help, but it demands a better, shinier, more modern protocol before it even considers cooperating.";
