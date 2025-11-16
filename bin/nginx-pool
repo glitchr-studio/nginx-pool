@@ -20,7 +20,7 @@
 # - Removing the lock file re-enables the VH.
 #
 # Smart fallback chain in NGINX (in order):
-#   (1)  <user>/<domain>/.sock     ← main dynamic backend   (UPDATED)
+#   (1)  <user>/<domain>.sock     ← main dynamic backend
 #   (2)  <user>/<domain>/(public/|current/)?index.php or index.html
 #   (3)  /home/nginx/www/localhost.sock (global PHP pool)
 #   (4)  /home/nginx/www/localhost/(public/|current/)?index.php|html
@@ -108,7 +108,7 @@ require_root() {
 }
 
 vhost_path() { echo "/home/$1/www/$2"; }
-vhost_lock_path() { echo "/home/$1/www/$2/.lock"; }
+vhost_lock_path() { echo "/home/$1/www/$2.lock"; }
 
 confirm() {
     local msg="$1"
@@ -210,7 +210,7 @@ extend_cert() {
     done
 
     # ============================================================
-    # 2. Discover candidate domains
+    # 2. Discover candidate domains from /home/<user>/www/<domain>
     # ============================================================
     echo -e "${BLUE}[*] Discovering candidate domains...${NC}"
     declare -A seen=()
@@ -227,7 +227,6 @@ extend_cert() {
                 dom=$(basename "$d")
 
                 [[ "$dom" =~ \.lock$ ]] && continue
-                [[ -f "$d/.lock" ]] && continue  # NEW: ignore new lock path
 
                 if [[ -z "${seen[$dom]:-}" ]]; then
                     seen["$dom"]=1
@@ -241,10 +240,12 @@ extend_cert() {
 
     # ============================================================
     # 3. Apply wildcard / literal filters
+    #    "*.apfelschorlette.fr" → match any domain ending in ".apfelschorlette.fr"
     # ============================================================
     local selected=()
     local flat_filters=()
 
+    # flatten comma-separated filters
     for f in "${filters[@]}"; do
         IFS=',' read -ra parts <<< "$f"
         for p in "${parts[@]}"; do
@@ -256,7 +257,7 @@ extend_cert() {
         local match=0
         for f in "${flat_filters[@]}"; do
             if [[ "$f" == \*.* ]]; then
-                local base="${f#*.}"
+                local base="${f#*.}"    # "*.apfelschorlette.fr" → "apfelschorlette.fr"
                 [[ "$dom" == *".$base" ]] && match=1 && break
             else
                 [[ "$dom" == "$f" ]] && match=1 && break
@@ -270,16 +271,20 @@ extend_cert() {
         exit 1
     fi
 
-    echo -e "${BLUE}[*] Selected domains:${NC}"
-    for d in "${selected[@]}"; do echo -e "  • ${GREEN}$d${NC}"; done
+    echo -e "${BLUE}[*] Selected domains (after filtering):${NC}"
+    for d in "${selected[@]}"; do
+        echo -e "  • ${GREEN}$d${NC}"
+    done
     echo
 
     # ============================================================
-    # 4. Merge SAN
+    # 4. Merge existing SAN + selected → final SAN list
+    #    (keep everything that already exists, add new)
     # ============================================================
     declare -A merged=()
     local final_san=()
 
+    # keep existing SANs
     for d in "${current_san[@]}"; do
         if [[ -z "${merged[$d]:-}" ]]; then
             merged["$d"]=1
@@ -287,6 +292,7 @@ extend_cert() {
         fi
     done
 
+    # add selected domains (only if not already present)
     local new_domains=()
     for d in "${selected[@]}"; do
         if [[ -z "${merged[$d]:-}" ]]; then
@@ -297,15 +303,21 @@ extend_cert() {
     done
 
     if [[ ${#new_domains[@]} -eq 0 ]]; then
-        echo -e "${GREEN}[✓] Already up-to-date.${NC}"
+        echo -e "${GREEN}[✓] All matching domains are already present in certificate ${CYAN}$cert_name${GREEN}.${NC}"
         return 0
     fi
 
-    echo -e "${BLUE}[*] Adding new domains:${NC}"
-    for d in "${new_domains[@]}"; do echo -e "  + ${GREEN}$d${NC}"; done
+    echo -e "${BLUE}[*] New domains to be added to ${CYAN}$cert_name${BLUE}:${NC}"
+    for d in "${new_domains[@]}"; do
+        echo -e "  + ${GREEN}$d${NC}"
+    done
     echo
 
-    echo -e "${BLUE}[*] Calling Certbot (--expand)...${NC}"
+    # ============================================================
+    # 5. Call certbot with FULL SAN LIST (to avoid removals)
+    # ============================================================
+    echo -e "${BLUE}[*] Calling Certbot (--expand) with merged SAN list...${NC}"
+
     certbot certonly \
         --webroot -w "$webroot" \
         --expand \
@@ -318,18 +330,21 @@ extend_cert() {
     fi
 
     systemctl reload nginx
-    echo -e "${GREEN}[✓] Certificate updated.${NC}"
+    echo -e "${GREEN}[✓] Certificate ${CYAN}$cert_name${GREEN} extended successfully.${NC}"
 }
 
 show_certs() {
     require_root
-    echo -e "${BLUE}[*] Listing certificates...${NC}"
+
+    echo -e "${BLUE}[*] Listing all certificates managed by Certbot...${NC}"
     echo
 
     local current_name=""
     local in_block=0
 
     certbot certificates 2>/dev/null | while IFS= read -r line; do
+
+        # Detect start of a certificate block
         if [[ "$line" =~ ^Certificate\ Name:\ (.*)$ ]]; then
             current_name="${BASH_REMATCH[1]}"
             in_block=1
@@ -337,22 +352,39 @@ show_certs() {
             continue
         fi
 
+        # Parse inside block
         if [[ $in_block -eq 1 ]]; then
+            # Domains
             if [[ "$line" =~ ^\ \ Domains:\ (.*)$ ]]; then
                 echo -e "${GRAY}Domains:${NC}        ${YELLOW}${BASH_REMATCH[1]}${NC}"
             fi
+
+            # Expiry
             if [[ "$line" =~ ^\ \ Expiry\ Date:\ (.*)$ ]]; then
-                echo -e "${GRAY}Expiry Date:${NC}    ${BASH_REMATCH[1]}"
+                local expiry="${BASH_REMATCH[1]}"
+                echo -e "${GRAY}Expiry Date:${NC}    ${expiry}"
+
+                # Warn about soon-expiring certs
+                if [[ "$expiry" =~ "VALID" ]]; then
+                    : # OK
+                else
+                    echo -e "               ${RED}[!] Certificate may be expired${NC}"
+                fi
             fi
+
+            # Certificate path
             if [[ "$line" =~ ^\ \ Certificate\ Path:\ (.*)$ ]]; then
                 echo -e "${GRAY}Certificate:${NC}    ${BASH_REMATCH[1]}"
             fi
+
+            # Private key path
             if [[ "$line" =~ ^\ \ Private\ Key\ Path:\ (.*)$ ]]; then
                 echo -e "${GRAY}Private Key:${NC}    ${BASH_REMATCH[1]}"
                 echo -e "------------------------------------------------------------"
                 in_block=0
             fi
         fi
+
     done
 
     echo
@@ -362,35 +394,45 @@ show_certs() {
 cert_renew() {
     require_root
 
-    echo -e "${BLUE}[*] Forcing Certbot renew...${NC}"
+    echo -e "${BLUE}[*] Forcing certificate renewal using Certbot...${NC}"
     echo
 
+    # Run certbot renew
     local output
     output=$(certbot renew 2>&1)
     local status=$?
 
     echo "$output"
 
+    # Check result
     if [[ $status -ne 0 ]]; then
         echo
         echo -e "${RED}[✗] Certbot renewal failed!${NC}"
+        echo -e "${YELLOW}Check logs:${NC} /var/log/letsencrypt/letsencrypt.log"
+        exit 1
+    fi
+
+    # Determine if any certificates were actually renewed
+    if echo "$output" | grep -q "No renewals were attempted"; then
+        echo
+        echo -e "${CYAN}[i] No certificates required renewal.${NC}"
+    else
+        echo
+        echo -e "${GREEN}[✓] Certificates successfully renewed.${NC}"
+    fi
+
+    echo -e "${BLUE}[*] Reloading nginx...${NC}"
+    systemctl reload nginx
+
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}[✓] NGINX reloaded successfully.${NC}"
+    else
+        echo -e "${RED}[✗] Failed to reload NGINX — please check configuration!${NC}"
         exit 1
     fi
 
     echo
-    if echo "$output" | grep -q "No renewals were attempted"; then
-        echo -e "${CYAN}[i] Nothing to renew.${NC}"
-    else
-        echo -e "${GREEN}[✓] Certificates renewed.${NC}"
-    fi
-
-    echo -e "${BLUE}[*] Reloading nginx...${NC}"
-    systemctl reload nginx && \
-        echo -e "${GREEN}[✓] NGINX reloaded.${NC}" || \
-        echo -e "${RED}[✗] Failed to reload NGINX.${NC}"
-
-    echo
-    echo -e "${GREEN}[✓] Done.${NC}"
+    echo -e "${GREEN}[✓] Renewal process completed.${NC}"
 }
 
 add_vhost() {
@@ -399,9 +441,7 @@ add_vhost() {
     local base site sock
     base=$(vhost_path "$user" "$domain")
     site="$base/public"
-
-    # UPDATED — sock inside domain dir
-    sock="$base/.sock"
+    sock="$base.sock"
 
     create_user_if_missing "$user"
     mkdir -p "$base"
@@ -427,23 +467,21 @@ EOF
     echo -e "    ${GRAY}Base path:    ${CYAN}$base${NC}"
     echo -e "    ${GRAY}Public path:  ${CYAN}$site${NC}"
     echo -e "    ${GRAY}Socket path:  ${CYAN}$sock${NC}"
-    echo -e "    ${GRAY}Lock file:    ${CYAN}${base}/.lock${NC}"
+    echo -e "    ${GRAY}Lock file:    ${CYAN}${base}.lock${NC}"
     echo -e "    ${GRAY}URLs:${NC}"
-    
     local EFFECTIVE_PORT=$([[ $PORT == 80 || $PORT == 443 ]] && echo "" || echo ":$PORT")
-    echo -e "      ${BLUE}https://$user.$MASTER${EFFECTIVE_PORT}/$domain/${NC}"
+    echo -e "      ${BLUE}https://$user.$MASTER${EFFECTIVE_PORT/$domain/${NC}"
 
     lock_vhost "$user" "$domain" > /dev/null
     fix_acl "$user" "$domain" > /dev/null
     usermap > /dev/null
 
     echo "[+] ACL permissions have been set."
-    echo "[-] Configure DNS for ${CYAN}$user.$MASTER${NC}."
-    echo "[-] Obtain certificates using certbot or extend-cert."
-    echo "[-] Unlock with: \"nginx-pool unlock $user $domain\""
-    echo "[-] Reload nginx if necessary."
+    echo "[-] Remember to configure your DNS to point ${CYAN}$user.$MASTER${NC} to $MASTER."
+    echo "[-] Then, obtain a certificate using certbot and/or extend-cert."
+    echo "[-] Finally, unlock the vhost using: \"nginx-pool unlock $user $domain\""
+    echo "[-] NGINX reload may be required to apply full changes."
 }
-
 usermap() {
 
     require_root
@@ -453,6 +491,7 @@ usermap() {
 
     echo -e "${BLUE}[*] Rebuilding NGINX user → domain map...${NC}"
 
+    # Header
     {
         echo "# Auto-generated by nginx-pool update-user-map"
         echo "# Format: domain   user;"
@@ -462,6 +501,7 @@ usermap() {
     local total_entries=0
     declare -A seen_domains=()
 
+    # Scan only www-data users
     while IFS=: read -r name _; do
         if id -nG "$name" 2>/dev/null | grep -qw www-data; then
 
@@ -474,8 +514,10 @@ usermap() {
                 local domain
                 domain=$(basename "$d")
 
-                [[ -f "$d/.lock" ]] && continue   # UPDATED ignore new lock path
+                # skip lock
+                [[ "$domain" =~ \.lock$ ]] && continue
 
+                # dedupe
                 if [[ -n "${seen_domains[$domain]:-}" ]]; then
                     echo -e "${YELLOW}[!] Duplicate domain skipped:${NC} ${CYAN}$domain${NC}"
                     continue
@@ -495,9 +537,8 @@ usermap() {
 
     echo
     echo -e "${GREEN}[✓] Updated: ${CYAN}$map_file${NC} (${total_entries} entries)."
-    echo -e "${YELLOW}Reload nginx to apply.${NC}"
+    echo -e "${YELLOW}Reload nginx to apply: ${CYAN}systemctl reload nginx${NC}"
 }
-
 update_symlinks() {
 
     require_root
@@ -510,6 +551,7 @@ update_symlinks() {
     declare -A valid_domains=()
     local total=0
 
+    # -------- Scan all www-data users --------
     while IFS=: read -r name _; do
         if id -nG "$name" 2>/dev/null | grep -qw www-data; then
             
@@ -522,21 +564,24 @@ update_symlinks() {
                 local domain
                 domain=$(basename "$d")
 
-                [[ -f "$d/.lock" ]] && continue  # UPDATED ignore new lock file
+                [[ "$domain" =~ \.lock$ ]] && continue
 
                 valid_domains["$domain"]="$d"
 
                 local link="$symlink_root/$domain"
 
+                # Stale symlink
                 if [[ -L "$link" && ! -e "$link" ]]; then
                     echo -e "${GRAY}[i] Removing stale symlink: $link${NC}"
                     rm -f "$link"
                 fi
 
+                # Create if missing
                 if [[ ! -L "$link" ]]; then
                     ln -s "$d" "$link"
                     echo -e "${GREEN}[+] Created symlink${NC} ${CYAN}$link → $d${NC}"
                 else
+                    # Fix incorrect target
                     local actual
                     actual=$(readlink -f "$link")
                     if [[ "$actual" != "$d" ]]; then
@@ -551,6 +596,7 @@ update_symlinks() {
         fi
     done < <(getent passwd)
 
+    # -------- Remove orphans --------
     for s in "$symlink_root"/*; do
         [[ -L "$s" ]] || continue
         local domain
@@ -606,12 +652,9 @@ list_vhosts() {
             [[ -d "$domain_dir" ]] || continue
             found=1
             total_domains=$((total_domains + 1))
-
             local domain lock status output
             domain=$(basename "$domain_dir")
-
-            # UPDATED lock path
-            lock="$domain_dir/.lock"
+            lock="$domain_dir.lock"
             [[ -f "$lock" ]] && status="${RED}LOCKED${NC}" || status="${GREEN}ACTIVE${NC}"
 
             if [[ "$show_urls" == "true" ]]; then
@@ -626,7 +669,6 @@ list_vhosts() {
 
         [[ $found -eq 0 ]] && echo -e "${GRAY}[i] ${CYAN}$user${GRAY}: no active virtual hosts.${NC}"
     done
-
     echo -e "-----------------------------------------------------------------------------------------------"
     echo -e "${GRAY}Summary:${NC} ${total_users} users scanned, ${total_domains} vhosts found."
 }
@@ -668,7 +710,7 @@ remove_vhost() {
         path=$(vhost_path "$user" "$domain")
         if [[ -d "$path" ]]; then
             if confirm "Remove domain '$domain' for user '$user'?"; then
-                rm -rf "$path" "$path/.lock" || true   # UPDATED path
+                rm -rf "$path" "$path.lock" || true
                 echo -e "${GREEN}[✓] Domain ${CYAN}$domain${GREEN} deleted.${NC}"
             fi
         else
