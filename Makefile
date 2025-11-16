@@ -40,7 +40,7 @@ php:
 conf: build-config
 	@cp bin/* /usr/local/bin/
 	@cp conf.d/* /etc/nginx/conf.d
-	@touch /etc/nginx/user_map.conf
+	@touch /etc/nginx/user.map
 	@nginx -t
 	@systemctl restart nginx
 
