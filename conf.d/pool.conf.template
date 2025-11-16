@@ -431,11 +431,12 @@ server {
         set $code 0;
         if (!-d $userland) { return 418; }
         if (!-d $webroot) { return 404; }
+        if ($domain = "") { return 404; }
 
         # Lock
         set $is_locked 0;
         if (-f $locker) { set $is_locked 1; }
-        if ($should_lock = 1) { return 403; }
+        if ($should_lock = 1) { return 423; }
 
         # Socket takes priority
         if (-e $socket) { return 590; }
