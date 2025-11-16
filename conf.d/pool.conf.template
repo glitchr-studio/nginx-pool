@@ -402,8 +402,8 @@ server {
     set $userland /home/$user/www;
 
     set $webroot $userland/$domain;
-    set $locker $webroot/.lock;
-    set $socket $webroot/.sock;
+    set $locker $webroot.lock;
+    set $socket $webroot.sock;
 
     add_header X-Pool-User   $pool_debug_user   always;
     add_header X-Pool-Domain $pool_debug_domain always;
