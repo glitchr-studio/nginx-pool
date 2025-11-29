@@ -514,36 +514,26 @@ update_ports_map() {
     # Safe associative array
     declare -A seen_domains=()
 
-    # --- Helper: extract port for proto ---
     extract_port() {
         local ports="$1"
-        local proto="$2"  # e.g. "80/tcp" or "443/tcp"
+        local proto="$2"
         local port=""
 
-        # IPv4: 0.0.0.0:PORT->80/tcp
         port=$(echo "$ports" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+->'"$proto" \
                          | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n1)
 
-        # IPv6: [::]:PORT->80/tcp
-        if [[ -z "$port" ]]; then
-            port=$(echo "$ports" | grep -oE '\[::\]:[0-9]+->'"$proto" \
-                             | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n1)
-        fi
+        [[ -n "$port" ]] || port=$(echo "$ports" | grep -oE '\[::\]:[0-9]+->'"$proto" \
+                         | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n1)
 
-        # Reverse mapping: 80/tcp -> 0.0.0.0:PORT
-        if [[ -z "$port" ]]; then
-            port=$(echo "$ports" | grep -oE "$proto"' -> [^,]+' \
-                             | sed -E 's/.*:([0-9]+).*/\1/' | head -n1)
-        fi
+        [[ -n "$port" ]] || port=$(echo "$ports" | grep -oE "$proto"' -> [^,]+' \
+                         | sed -E 's/.*:([0-9]+).*/\1/' | head -n1)
 
         echo "${port:-0}"
     }
 
-    # --- Iterate www-data home dirs ---
     while IFS=: read -r user _; do
 
         id -nG "$user" 2>/dev/null | grep -qw www-data || continue
-
         local root="/home/$user/www"
         [[ -d "$root" ]] || continue
 
@@ -555,22 +545,17 @@ update_ports_map() {
 
             [[ "$domain" =~ \.lock$ ]] && continue
 
-            # Skip duplicates safely (avoids "unbound variable")
-            if [[ ${seen_domains[$domain]+_} ]]; then
-                continue
-            fi
+            if [[ ${seen_domains[$domain]+_} ]]; then continue; fi
             seen_domains[$domain]=1
 
-            # Proxy container name
             local project="${domain//./}"
             local proxy="${project}-proxy"
 
-            # Container ID
             local cid
             cid=$(docker ps --filter "name=^${proxy}$" --format '{{.ID}}')
 
             if [[ -z "$cid" ]]; then
-                echo -e "${YELLOW}[!] No proxy container found for ${CYAN}$domain${YELLOW} (expected: ${CYAN}${proxy}${YELLOW})${NC}"
+                echo -e "${YELLOW}[!] No proxy container for ${CYAN}$domain${YELLOW} (expected ${CYAN}${proxy}${YELLOW})${NC}"
                 http_port=0
                 https_port=0
             else
@@ -590,13 +575,32 @@ update_ports_map() {
 
     done < <(getent passwd)
 
-    mv "$tmp_http" "$map_http"
-    mv "$tmp_https" "$map_https"
+    # ======================================================
+    #  DIFF + conditional reload (NO reload if unchanged!)
+    # ======================================================
+    changed=0
 
-    echo
-    echo -e "${GREEN}[✓] port_http.map + port_https.map updated${NC}"
-    echo -e "${YELLOW}Reloading nginx..${NC}"
-    systemctl reload nginx
+    if ! cmp -s "$tmp_http" "$map_http"; then
+        mv "$tmp_http" "$map_http"
+        changed=1
+    else
+        rm -f "$tmp_http"
+    fi
+
+    if ! cmp -s "$tmp_https" "$map_https"; then
+        mv "$tmp_https" "$map_https"
+        changed=1
+    else
+        rm -f "$tmp_https"
+    fi
+
+    if [[ $changed -eq 1 ]]; then
+        echo -e "${GREEN}[✓] Maps updated.${NC}"
+        echo -e "${YELLOW}Reloading nginx (changes detected)…${NC}"
+        systemctl reload nginx
+    else
+        echo -e "${CYAN}[i] No changes detected — NGINX not reloaded.${NC}"
+    fi
 }
 
 users() {
@@ -620,6 +624,7 @@ users() {
 
     # Scan only www-data users
     while IFS=: read -r name _; do
+
         if id -nG "$name" 2>/dev/null | grep -qw www-data; then
 
             local root="/home/$name/www"
@@ -646,16 +651,30 @@ users() {
 
                 total_entries=$((total_entries + 1))
             done
-
         fi
+
     done < <(getent passwd)
 
-    mv "$tmp_file" "$map_file"
+    # ---------------------------------------------------------
+    #  ONLY RELOAD NGINX IF FILE CONTENT CHANGED
+    # ---------------------------------------------------------
 
-    echo
-    echo -e "${GREEN}[✓] Updated: ${CYAN}$map_file${NC} (${total_entries} entries)."
-    echo -e "${YELLOW}Reloading nginx: ${CYAN}systemctl reload nginx${NC}"
-    systemctl reload nginx
+    if ! cmp -s "$tmp_file" "$map_file"; then
+        # different → update file atomically + reload nginx
+        mv "$tmp_file" "$map_file"
+
+        echo
+        echo -e "${GREEN}[✓] Updated: ${CYAN}$map_file${NC} (${total_entries} entries)."
+        echo -e "${YELLOW}Reloading nginx…${NC}"
+        systemctl reload nginx
+    else
+        # same → no update needed
+        rm -f "$tmp_file"
+
+        echo
+        echo -e "${CYAN}[i] No changes detected — ${map_file} unchanged.${NC}"
+        echo -e "${CYAN}[i] NGINX not reloaded.${NC}"
+    fi
 }
 
 update_symlinks() {
