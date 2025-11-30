@@ -4,7 +4,7 @@
 # ----------------------------------------------------------
 # Usage:
 #   nginx-pool add <user> <domain> [--master <domain>]
-#   nginx-pool list [--urls] [--master <domain>]
+#   nginx-pool list [--local] [--master <domain>]
 #   nginx-pool extend-cert <domain>
 #   nginx-pool lock <user> <domain>
 #   nginx-pool unlock <user> <domain>
@@ -28,6 +28,14 @@
 # ==========================================================
 
 set -euo pipefail
+export LC_ALL=C
+export LANG=C
+
+# USER may not exist in cron
+if [ -z "${USER:-}" ]; then
+    USER="$(id -un 2>/dev/null || echo root)"
+    export USER
+fi
 
 # ---------- Sudo context ----------
 if [[ -n "${SUDO_USER:-}" ]]; then
@@ -43,7 +51,8 @@ PORT=$(awk '/listen/ && /ssl/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) print $i}
 
 # Default pool domain
 MASTER="localhost"
-SHOW_URLS=false
+SHOW_LOCALS=false
+SHOW_BACKEND=false
 
 # ---------- Parse flags ----------
 ARGS=()
@@ -53,8 +62,12 @@ while [[ $# -gt 0 ]]; do
             MASTER="${2:-localhost}"
             shift 2
             ;;
-        --urls)
-            SHOW_URLS=true
+        --local)
+            SHOW_LOCALS=true
+            shift
+            ;;
+        --backend)
+            SHOW_BACKEND=true
             shift
             ;;
         *)
@@ -82,7 +95,7 @@ NC='\033[0m' # No Color / Reset
 usage() {
     echo -e "${YELLOW}Usage:${NC}"
     echo -e "  $0 add <user> <domain> [--master <domain>]"
-    echo -e "  $0 list [--urls] [--master <domain>]"
+    echo -e "  $0 list [--local] [--master <domain>]"
     echo -e "  $0 extend-cert <domain>"
     echo -e "  $0 show-certs"
     echo -e "  $0 cert-renew"
@@ -94,7 +107,7 @@ usage() {
     echo -e "  $0 users"
     echo
     echo -e "${BLUE}Examples:${NC}"
-    echo -e "  $0 list --urls --master pool.domain.com"
+    echo -e "  $0 list --local --master pool.domain.com"
     echo -e "  $0 add alice example.com --master pool.domain.com"
     echo
     exit 1
@@ -556,8 +569,7 @@ update_ports_map() {
 
             if [[ -z "$cid" ]]; then
                 echo -e "${YELLOW}[!] No proxy container for ${CYAN}$domain${YELLOW} (expected ${CYAN}${proxy}${YELLOW})${NC}"
-                http_port=0
-                https_port=0
+                continue  # DO NOT write anything to the maps
             else
                 local ports
                 ports=$(docker ps --filter "id=$cid" --format '{{.Ports}}')
@@ -565,11 +577,19 @@ update_ports_map() {
                 http_port=$(extract_port "$ports" "80/tcp")
                 https_port=$(extract_port "$ports" "443/tcp")
 
-                echo -e "  ${CYAN}$domain${NC} → HTTP=${GREEN}${http_port}${NC}, HTTPS=${GREEN}${https_port}${NC}"
+                echo -e "Port mapping for ${CYAN}$domain${NC} detected: HTTP=${GREEN}${http_port}${NC}, HTTPS=${GREEN}${https_port}${NC}"
             fi
 
-            printf "%s %s;\n" "$domain" "$http_port" >> "$tmp_http"
-            printf "%s %s;\n" "$domain" "$https_port" >> "$tmp_https"
+            # If docker container exists (EXTERN backend), ALWAYS write both entries.
+            # Missing ports become 0.
+            if [[ -n "$cid" ]]; then
+                # Ensure both ports are numeric
+                [[ "$http_port" =~ ^[0-9]+$ ]] || http_port=0
+                [[ "$https_port" =~ ^[0-9]+$ ]] || https_port=0
+
+                printf "%s %s;\n" "$domain" "$http_port" >> "$tmp_http"
+                printf "%s %s;\n" "$domain" "$https_port" >> "$tmp_https"
+            fi
 
         done
 
@@ -677,6 +697,85 @@ users() {
     fi
 }
 
+nginx_port_from_map() {
+    local map="$1"
+    local domain="$2"
+    awk -v d="$domain" '
+        $1 == d {
+            gsub(/;/, "", $2);
+            print $2;
+            exit
+        }
+    ' "$map" 2>/dev/null
+}
+
+extern_backend_ports() {
+    local domain="$1"
+    local http_port https_port
+
+    http_port=$(nginx_port_from_map "/etc/nginx/port_http.map" "$domain")
+    https_port=$(nginx_port_from_map "/etc/nginx/port_https.map" "$domain")
+
+    # ensure numeric
+    [[ "$http_port" =~ ^[0-9]+$ ]] || http_port=0
+    [[ "$https_port" =~ ^[0-9]+$ ]] || https_port=0
+
+    echo "${http_port}:${https_port}"
+}
+is_extern_backend() {
+    local domain="$1"
+    local http_port https_port
+
+    http_port=$(nginx_port_from_map "/etc/nginx/port_http.map" "$domain")
+    https_port=$(nginx_port_from_map "/etc/nginx/port_https.map" "$domain")
+
+    # Either port being non-zero means EXTERN
+    if [[ "$http_port" =~ ^[0-9]+$ && "$http_port" -ne 0 ]]; then
+        return 0
+    fi
+    if [[ "$https_port" =~ ^[0-9]+$ && "$https_port" -ne 0 ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+detect_backend_type() {
+    local user="$1"
+    local domain="$2"
+    local root="/home/$user/www/$domain"
+
+    # 1) SOCK backend
+    if [[ -S "${root}.sock" ]]; then
+        echo "SOCK"
+        return
+    fi
+
+    # 2) EXTERN backend → return formatted HTTP:xxx/yyy
+    if is_extern_backend "$domain"; then
+        local ports
+        ports=$(extern_backend_ports "$domain")
+        echo "MAP:${ports}"
+        return
+    fi
+
+    # 3) LEGACY backend
+    if [[ -f /etc/nginx/legacy.map ]] && grep -q "^${domain} " /etc/nginx/legacy.map; then
+        echo "LEGACY"
+        return
+    fi
+
+    # 4) Standard static / PHP
+    if [[ -f "$root/public/index.php" || -f "$root/public/index.html" \
+       || -f "$root/index.php"       || -f "$root/index.html" ]]; then
+        echo "STANDARD"
+        return
+    fi
+
+    # 5) Default nginx fallback
+    echo "NGINX"
+}
+
 update_symlinks() {
 
     require_root
@@ -753,16 +852,23 @@ update_symlinks() {
 
 list_vhosts() {
     local filter_user="${1:-*}"
-    local show_urls="${2:-$SHOW_URLS}"
+    local show_local_urls="${2:-$SHOW_LOCALS}"
 
     echo -e "${BLUE}[*] Listing pool virtual hosts (www-data members):${NC}"
-    echo -e "-----------------------------------------------------------------------------------------------"
-    if [[ "$show_urls" == "true" ]]; then
-        printf "%-15s %-25s %-10s %-60s\n" "USER" "DOMAIN" "STATUS" "URL"
+    echo -e "----------------------------------------------------------------------------------------------------------------"
+    if [[ "$show_local_urls" == "true" ]]; then
+        local="LOCAL URL"
     else
-        printf "%-15s %-25s %-10s %-60s\n" "USER" "DOMAIN" "STATUS" "LOCAL DIRECTORY"
+        local="LOCAL DIRECTORY"
     fi
-    echo -e "-----------------------------------------------------------------------------------------------"
+    
+    if [[ "$SHOW_BACKEND" == true ]]; then
+        printf "%-15s %-40s %-35b %-60s\n" "USER" "DOMAIN" "STATUS" "$local"
+    else
+        printf "%-15s %-40s %-20b %-60s\n" "USER" "DOMAIN" "STATUS" "$local"
+    fi
+    
+    echo -e "----------------------------------------------------------------------------------------------------------------"
 
     local users=()
     while IFS=: read -r name _; do
@@ -793,16 +899,32 @@ list_vhosts() {
             local domain lock status output
             domain=$(basename "$domain_dir")
             lock="$domain_dir.lock"
-            [[ -f "$lock" ]] && status="${RED}LOCKED${NC}" || status="${GREEN}ACTIVE${NC}"
 
-            if [[ "$show_urls" == "true" ]]; then
+            if [[ "$SHOW_BACKEND" == true ]]; then
+                backend=$(detect_backend_type "$user" "$domain")
+                backend_label=" [${backend}]"
+            else
+                backend_label=""
+            fi
+
+            if [[ -f "$lock" ]]; then
+                status="${RED}LOCKED${NC}${backend_label}"
+            else
+                status="${GREEN}ACTIVE${NC}${backend_label}"
+            fi
+
+            if [[ "$show_local_urls" == "true" ]]; then
                 local EFFECTIVE_PORT=$([[ $PORT == 80 || $PORT == 443 ]] && echo "" || echo ":$PORT")
                 output="https://$user.$MASTER${EFFECTIVE_PORT}/$domain/"
             else
                 output="$domain_dir"
             fi
 
-            printf "%-15s %-25s %-10b %-60s\n" "$user" "$domain" "$status" "$output"
+            if [[ "$SHOW_BACKEND" == true ]]; then
+                printf "%-15s %-40s %-35b %-60s\n" "$user" "https://$domain" "$status" "$output"
+            else
+                printf "%-15s %-40s %-20b %-60s\n" "$user" "https://$domain" "$status" "$output"
+            fi
         done
 
         [[ $found -eq 0 ]] && echo -e "${GRAY}[i] ${CYAN}$user${GRAY}: no active virtual hosts.${NC}"
@@ -868,7 +990,7 @@ case "$cmd" in
   unlock)   [[ -z "$u" || -z "$d" ]] && usage; unlock_vhost "$u" "$d" ;;
   remove|rm)[[ -z "$u" ]] && usage; remove_vhost "$u" "$d" ;;
   acl)      [[ -z "$u" ]] && usage; fix_acl "$u" "$d" ;;
-  list|"")  list_vhosts "*" "$SHOW_URLS" ;;
+  list|"")  list_vhosts "*" "$SHOW_LOCALS" ;;
   show-certs) show_certs ;;
   cert-renew) cert_renew ;;
   extend-cert)

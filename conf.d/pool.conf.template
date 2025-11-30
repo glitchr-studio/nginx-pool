@@ -18,16 +18,49 @@ map $host $legacy_map {
     default 0;
 }
 
-map $host $port_http  { include /etc/nginx/port_http.map;  default 0; }
-map $host $port_https { include /etc/nginx/port_https.map; default 0; }
+# ------------------------------------------------------
+# Port mapping (raw + numeric) + existence flags
+# ------------------------------------------------------
+# raw maps: distinguish "no entry" from "entry with 0"
+map $host $port_http_raw  { include /etc/nginx/port_http.map;  default "__none__"; }
+map $host $port_https_raw { include /etc/nginx/port_https.map; default "__none__"; }
 
+# numeric ports: "__none__" -> 0, others copied as-is
+map $port_http_raw $port_http {
+    "__none__" 0;
+    default    $port_http_raw;
+}
+map $port_https_raw $port_https {
+    "__none__" 0;
+    default    $port_https_raw;
+}
+
+# does this host have an explicit entry in at least one map?
+map "$port_http_raw $port_https_raw" $entry_found {
+    "__none__ __none__" 0;   # no entry in either map
+    default            1;    # at least one entry exists
+}
+
+# at least one non-zero port?
 map "$port_http$port_https" $has_port {
     default 0;
     ~*[1-9] 1;
 }
 
+# entry is invalid extern if it exists but all ports = 0
+map "$entry_found $has_port" $extern_invalid {
+    "1 0" 1;       # entry present, but 0/0 → misconfigured extern
+    default 0;     # everything else
+}
+
 # HTTPS flag
 map $http_x_forwarded_proto $fe_https { default off; https on; }
+map $http_x_forwarded_proto $fe_proto {
+    default $scheme;
+    http    http;
+    https   https;
+}
+
 map "$fe_https $port_https" $prefer_https_port {
     ~^on\ [1-9]   $port_https;
     default       0;
@@ -334,7 +367,7 @@ map $http_upgrade $connection_upgrade { default upgrade; '' close; }
 server {
     listen 80 default_server;
     server_name _;
-    return 301 https://$host$request_uri;
+    return 308 https://$http_host$request_uri;
 }
 
 # ======================================================
@@ -423,7 +456,9 @@ server {
 
     set $webroot $userland/$domain;
     set $locker $webroot.lock;
-    set $socket $webroot.sock;
+    if ( -e $webroot.sock ) {
+        set $socket $webroot.sock;
+    }
 
     add_header X-Pool-User   $pool_debug_user   always;
     add_header X-Pool-Domain $pool_debug_domain always;
@@ -434,18 +469,6 @@ server {
     add_header X-Pool-Http   $pool_debug_http always;
     add_header X-Pool-Https  $pool_debug_https always;
     add_header X-Pool-Legacy $pool_debug_legacy always;
-    
-    # ======================================================
-    # NGINX DEFAULT
-    # ======================================================
-    error_page 589 = @nginx_default;
-    location @nginx_default {
-
-        set $code 589;
-        root /usr/share/nginx/html;
-        
-        try_files $uri /index.html =404;
-    }
     
     # ======================================================
     # DISPATCHER
@@ -465,6 +488,10 @@ server {
         # Socket takes priority
         if (-e $socket) { return 590; }
 
+        # Invalid extern: entry exists but both ports are zero → 404
+        if ($extern_invalid = 1) { return 404; }
+        if ($has_port = 1) { return 591; }
+        
         # Recompute legacy mode (runtime) — lazy maps will re-evaluate
         set $auto_legacy 1;
         if (-d $webroot/current) { set $webroot $webroot/current; }
@@ -482,12 +509,11 @@ server {
         proxy_cache_bypass $edge_cache_bypass;
         proxy_no_cache     $edge_cache_bypass;
 
-        if ($has_port) { return 595; }
-        if ($is_static = 1) { return 591; }
-        if (-f $webroot$php_script) { return 592; }
-        if (-f $webroot/index.html) { return 593; }
+        if ($is_static = 1) { return 592; }
+        if (-f $webroot$php_script) { return 593; }
+        if (-f $webroot/index.html) { return 594; }
 
-        return 594;
+        return 595;
     }
 
     # ======================================================
@@ -500,12 +526,51 @@ server {
     }
 
     # ======================================================
+    # PORT FALLBACK — OPTION A FIX
+    # ======================================================
+    error_page 591 = @port_fallback;
+    location @port_fallback {
+
+        internal;
+        set $code 591;
+
+        #
+        # CRITICAL: FORCE Docker to think connection is HTTPS
+        #
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Ssl   on;
+        proxy_set_header X-Forwarded-Port  443;
+        proxy_set_header Host $host;
+
+        # Prevent backend loops
+        proxy_redirect off;
+
+        # Prefer HTTPS backend
+        if ($prefer_https_port != 0) {
+            proxy_pass https://127.0.0.1:$prefer_https_port;
+            break;
+        }
+
+        if ($port_https != 0) {
+            proxy_pass https://127.0.0.1:$port_https;
+            break;
+        }
+
+        if ($port_http != 0) {
+            proxy_pass http://127.0.0.1:$port_http;
+            break;
+        }
+
+        return 404;
+    }
+
+    # ======================================================
     # STATIC FALLBACK
     # ======================================================
-    error_page 591 = @asset_resolver;
+    error_page 592 = @asset_resolver;
     location @asset_resolver {
 
-        set $code 591;
+        set $code 592;
         root $webroot;
 
         try_files $uri @php_fallback;
@@ -514,10 +579,10 @@ server {
     # ======================================================
     # PHP FALLBACK
     # ======================================================
-    error_page 592 = @php_fallback;
+    error_page 593 = @php_fallback;
     location @php_fallback {
 
-        set $code 592;
+        set $code 593;
         include fastcgi_params;
 
         fastcgi_cache         $fcgi_cache_enable;
@@ -537,19 +602,22 @@ server {
     # ======================================================
     # HTML FALLBACK
     # ======================================================
-    error_page 593 = @html_fallback;
+    error_page 594 = @html_fallback;
     location @html_fallback {
-        set $code 593;
+
+        set $code 594;
         root $webroot;
+
         try_files $uri /index.html @nginx_default;
     }
 
     # ======================================================
     # NGINX FALLBACK
     # ======================================================
-    error_page 594 = @nginx_fallback;
+    error_page 595 = @nginx_fallback;
     location @nginx_fallback {
-        set $code 594;
+
+        set $code 595;
         root /home/nginx/www/localhost;
 
         sub_filter_once off;
@@ -560,43 +628,17 @@ server {
     }
 
     # ======================================================
-    # PORT FALLBACK
+    # NGINX DEFAULT
     # ======================================================
-    error_page 595 = @port_fallback;
-    location @port_fallback {
-        internal;
-        set $code 595;
+    error_page 596 = @nginx_default;
+    location @nginx_default {
 
-        #
-        # 1. If frontend HTTPS → use https backend when it exists
-        #
-        if ($prefer_https_port != 0) {
-            proxy_pass http://127.0.0.1:$prefer_https_port;
-            break;
-        }
-
-        #
-        # 2. Otherwise prefer plain HTTP backend (MAIN nginx handles TLS)
-        #
-        if ($port_http != 0) {
-            proxy_pass http://127.0.0.1:$port_http;
-            break;
-        }
-
-        #
-        # 3. As last resort, use the https backend anyway
-        #
-        if ($port_https != 0) {
-            proxy_pass http://127.0.0.1:$port_https;
-            break;
-        }
-
-        #
-        # 4. No backends → return nginx fallback
-        #
-        return 594;
+        set $code 596;
+        root /usr/share/nginx/html;
+        
+        try_files $uri /index.html =404;
     }
-
+    
     # ======================================================
     # Unified Dynamic Error Template Loader
     # ======================================================
