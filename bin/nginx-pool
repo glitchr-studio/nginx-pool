@@ -53,6 +53,7 @@ PORT=$(awk '/listen/ && /ssl/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) print $i}
 MASTER="localhost"
 SHOW_LOCALS=false
 SHOW_BACKEND=false
+KEEP_MISSING_PORTS=false
 
 # ---------- Parse flags ----------
 ARGS=()
@@ -68,6 +69,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --backend)
             SHOW_BACKEND=true
+            shift
+            ;;
+        --preserve ) KEEP_MISSING_PORTS=true; shift ;;
+        --no-delete) KEEP_MISSING_PORTS=true; shift ;;
+        --keep-missing-ports)
+            KEEP_MISSING_PORTS=true
             shift
             ;;
         *)
@@ -497,6 +504,17 @@ EOF
     echo "[-] NGINX reload may be required to apply full changes."
 }
 
+is_docker_mapped_before() {
+    local domain="$1"
+    local esc=$(printf '%s' "$domain" | sed 's/[][\/.^$*+?|(){}]/\\&/g')
+
+    local re="^${esc}[[:space:]]+[0-9]+;[[:space:]]*#[[:space:]]*docker"
+
+    grep -qE "$re" /etc/nginx/port_http.map 2>/dev/null && return 0
+    grep -qE "$re" /etc/nginx/port_https.map 2>/dev/null && return 0
+    return 1
+}
+
 update_ports_map() {
 
     require_root
@@ -508,6 +526,36 @@ update_ports_map() {
     local tmp_https="${map_https}.tmp"
 
     echo -e "${BLUE}[*] Rebuilding ${CYAN}port_http.map${BLUE} and ${CYAN}port_https.map${BLUE}…${NC}"
+
+    # Load existing maps to know which domains were already present
+    declare -A old_http_ports=()
+    declare -A old_https_ports=()
+
+    if [[ -f "$map_http" ]]; then
+        while read -r dom port _; do
+            # strip trailing semicolon
+            [[ -n "${port:-}" ]] && port="${port%;}"
+
+            # skip invalid lines
+            if [[ -z "${dom:-}" || "$dom" =~ ^# || -z "${port:-}" ]]; then
+                continue
+            fi
+
+            old_http_ports["$dom"]="$port"
+        done < "$map_http"
+    fi
+
+    if [[ -f "$map_https" ]]; then
+        while read -r dom port _; do
+            [[ -n "${port:-}" ]] && port="${port%;}"
+
+            if [[ -z "${dom:-}" || "$dom" =~ ^# || -z "${port:-}" ]]; then
+                continue
+            fi
+
+            old_https_ports["$dom"]="$port"
+        done < "$map_https"
+    fi
 
     # Headers
     {
@@ -524,7 +572,7 @@ update_ports_map() {
         echo
     } > "$tmp_https"
 
-    # Safe associative array
+    # Track which domains we already processed
     declare -A seen_domains=()
 
     extract_port() {
@@ -556,9 +604,16 @@ update_ports_map() {
             local domain
             domain=$(basename "$dir")
 
+            # NEW: prevent empty domain (required for set -u safety)
+            if [[ -z "$domain" || "$domain" == "." || "$domain" == ".." ]]; then
+                continue
+            fi
+
             [[ "$domain" =~ \.lock$ ]] && continue
 
-            if [[ ${seen_domains[$domain]+_} ]]; then continue; fi
+            if [[ -n "${seen_domains[$domain]+x}" ]]; then
+                continue
+            fi
             seen_domains[$domain]=1
 
             local project="${domain//./}"
@@ -568,35 +623,42 @@ update_ports_map() {
             cid=$(docker ps --filter "name=^${proxy}$" --format '{{.ID}}')
 
             if [[ -z "$cid" ]]; then
-                echo -e "${YELLOW}[!] No proxy container for ${CYAN}$domain${YELLOW} (expected ${CYAN}${proxy}${YELLOW})${NC}"
-                continue  # DO NOT write anything to the maps
-            else
-                local ports
-                ports=$(docker ps --filter "id=$cid" --format '{{.Ports}}')
+                echo -e "${YELLOW}[!] Missing proxy container for ${CYAN}$domain${YELLOW} (expected: ${CYAN}${proxy}${YELLOW})${NC}"
 
-                http_port=$(extract_port "$ports" "80/tcp")
-                https_port=$(extract_port "$ports" "443/tcp")
+                if is_docker_mapped_before "$domain"; then
+                    # CASE 1: previously docker-managed
+                    if [[ "$KEEP_MISSING_PORTS" == true ]]; then
+                        echo -e "${CYAN}    Preserving docker entry for ${domain} with ports=0${NC}"
+                        printf "%s 0; # docker\n" "$domain" >> "$tmp_http"
+                        printf "%s 0; # docker\n" "$domain" >> "$tmp_https"
+                    else
+                        echo -e "${YELLOW}[i] Removing docker entry for ${domain}${NC}"
+                    fi
 
-                echo -e "Port mapping for ${CYAN}$domain${NC} detected: HTTP=${GREEN}${http_port}${NC}, HTTPS=${GREEN}${https_port}${NC}"
+                else
+                    # CASE 2: MANUAL ENTRY → preserve existing ports
+                    echo -e "${BLUE}[i] ${domain} is manual — preserving existing ports${NC}"
+
+                    if [[ -n "${old_http_ports[$domain]+x}" ]]; then
+                        printf "%s %s;\n" "$domain" "${old_http_ports[$domain]}" >> "$tmp_http"
+                    fi
+
+                    if [[ -n "${old_https_ports[$domain]+x}" ]]; then
+                        printf "%s %s;\n" "$domain" "${old_https_ports[$domain]}" >> "$tmp_https"
+                    fi
+                fi
+
+                continue
             fi
 
-            # If docker container exists (EXTERN backend), ALWAYS write both entries.
-            # Missing ports become 0.
-            if [[ -n "$cid" ]]; then
-                # Ensure both ports are numeric
-                [[ "$http_port" =~ ^[0-9]+$ ]] || http_port=0
-                [[ "$https_port" =~ ^[0-9]+$ ]] || https_port=0
-
-                printf "%s %s;\n" "$domain" "$http_port" >> "$tmp_http"
-                printf "%s %s;\n" "$domain" "$https_port" >> "$tmp_https"
-            fi
+            # (docker-managed container found — your later logic goes here)
 
         done
 
     done < <(getent passwd)
 
     # ======================================================
-    #  DIFF + conditional reload (NO reload if unchanged!)
+    #  DIFF + conditional reload
     # ======================================================
     changed=0
 
