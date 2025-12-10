@@ -371,13 +371,16 @@ server {
 }
 
 # ======================================================
-# Main HTTPS / HTTP3 server
+# Main HTTPS
 # ======================================================
 server {
 
     listen 443 ssl default_server;
-    listen 443 quic reuseport;
     http2 on;
+
+    # Optional HTTP3, only if 443/UDP is opened and nginx compiled with http3 options.
+    #listen 443 quic reuseport;
+    #add_header Alt-Svc 'h3=":443"; ma=86400' always;
 
     server_name _;
     server_tokens off;
@@ -400,7 +403,6 @@ server {
     large_client_header_buffers 8 128k;
 
     # Security + HTTP3
-    add_header Alt-Svc 'h3=":443"; ma=86400' always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "SAMEORIGIN" always;
