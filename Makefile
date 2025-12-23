@@ -40,7 +40,8 @@ php:
 conf: build-config
 	@cp bin/* /usr/local/bin/
 	@cp conf.d/* /etc/nginx/conf.d
-	@touch /etc/nginx/users.map /etc/nginx/legacy.map /etc/nginx/ports_http.map /etc/nginx/ports_https.map
+	@touch /etc/nginx/users.map /etc/nginx/legacy.map /etc/nginx/domains.map
+	@touch /etc/nginx/ports_http.map /etc/nginx/ports_https.map
 	@nginx -t
 	@systemctl restart nginx
 
