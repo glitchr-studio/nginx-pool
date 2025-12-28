@@ -45,6 +45,39 @@ map "$is_range_request $has_port" $has_streaming_port {
     default 0;
 }
 
+# --------------------------------------------------
+# Pool / localhost first-path canonicalization
+# --------------------------------------------------
+map $host $is_pool_host {
+    default 0;
+    ~*\.pool\.glitchr\.dev$ 1;
+    ~*\.localhost$         1;
+    localhost              1;
+}
+
+map "$is_pool_host:$uri" $needs_domain_slash {
+    default 0;
+    ~^1:/[^/]+$ 1;
+}
+
+map "$is_pool_host:$host" $host_user {
+    default "";
+
+    ~^1:([^.]+)\..+$ $1;
+}
+
+map "$pool_user:$host_user" $user {
+    ~^([^:]+):   $1;
+    ~^:([^:]+)$  $1;
+    default      nginx;
+}
+
+map "$is_pool_host:$uri" $rewritten_uri {
+    default $uri;
+    ~^1:/[^/]+(/.*)$ $1;
+    ~^1:/[^/]+$      /;
+}
+
 # ------------------------------------------------------
 # Port mapping (raw + numeric) + existence flags
 # ------------------------------------------------------
@@ -112,7 +145,7 @@ map $http_x_pool_debug $pool_debug_allowed {
 map $pool_debug_allowed $pool_debug_user   { 1 "$user";   default ""; }
 map $pool_debug_allowed $pool_debug_domain { 1 "$domain"; default ""; }
 map $pool_debug_allowed $pool_debug_script { 1 "$php_script"; default ""; }
-map $pool_debug_allowed $pool_debug_uri    { 1 "$uri"; default ""; }
+map $pool_debug_allowed $pool_debug_uri    { 1 "$rewritten_uri"; default ""; }
 map $pool_debug_allowed $pool_debug_code   { 1 "$code"; default ""; }
 map $pool_debug_allowed $pool_debug_socket { 1 "$socket"; default ""; }
 map $pool_debug_allowed $pool_debug_legacy { 1 "$is_legacy"; default ""; }
@@ -460,12 +493,30 @@ server {
         root /var/www/letsencrypt;
     }
 
+
+    # --------------------------------------------------
+    # Pool first-path canonicalization (NO if)
+    # --------------------------------------------------
+    location ~ ^/[^/]+$ {
+
+        # Only act for pool / localhost
+        if ($needs_domain_slash = 0) {
+            return 404;
+        }
+
+        return 308 $scheme://$host$uri/;
+    }
+
     # robots.txt
     location = /robots.txt {
+
         default_type text/plain;
-        if ($host ~* pool\.glitchr\.dev$) {
+
+        if ($is_pool_host = 1) {
             return 200 "User-agent: *\nDisallow: /\n";
         }
+
+        try_files /robots.txt =404;
     }
 
     # direct error access
@@ -482,15 +533,10 @@ server {
     # -------------------------------------------------
     # Resolve user/domain and filesystem roots
     # -------------------------------------------------
-    set $user "";
-    if ($host ~* ^([^.]+)\.pool\.glitchr\.dev$) { set $user $1; }
-    if ($host ~* ^([^.]+)\.localhost$)          { set $user $1; }
-    if ($pool_user != "")                       { set $user $pool_user; }
-    if ($user = "")                             { set $user nginx; }
-
+    set $domain $host;
     if ($uri ~* ^/([^/]+)/?) { set $domain $1; }
     if ($user = "$pool_user") { set $domain $host; }
-
+    
     set $userland /home/$user/www;
 
     set $webroot $userland/$domain;
@@ -587,17 +633,17 @@ server {
 
         # Prefer HTTPS backend
         if ($prefer_https_port != 0) {
-            proxy_pass https://127.0.0.1:$prefer_https_port;
+            proxy_pass https://127.0.0.1:$prefer_https_port$rewritten_uri;
             break;
         }
 
         if ($port_https != 0) {
-            proxy_pass https://127.0.0.1:$port_https;
+            proxy_pass https://127.0.0.1:$port_https$rewritten_uri;
             break;
         }
 
         if ($port_http != 0) {
-            proxy_pass http://127.0.0.1:$port_http;
+            proxy_pass http://127.0.0.1:$port_http$rewritten_uri;
             break;
         }
 
