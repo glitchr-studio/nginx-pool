@@ -4,7 +4,7 @@
 # ----------------------------------------------------------
 # Usage:
 #   nginx-pool add <user> <domain> [--master <domain>]
-#   nginx-pool list [--local] [--master <domain>]
+#   nginx-pool list [--local] [--backend] [--master <domain>]
 #   nginx-pool extend-cert <domain>
 #   nginx-pool lock <user> <domain>
 #   nginx-pool unlock <user> <domain>
