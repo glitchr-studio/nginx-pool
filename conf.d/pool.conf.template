@@ -555,6 +555,10 @@ server {
     add_header X-Pool-Https  $pool_debug_https always;
     add_header X-Pool-Legacy $pool_debug_legacy always;
     
+    add_header X-Debug-Args "$args" always;
+    add_header X-Debug-Request-Uri "$request_uri" always;
+    add_header X-Debug-Rewritten-Uri "$rewritten_uri" always;
+
     # ======================================================
     # DISPATCHER
     # ======================================================
@@ -633,17 +637,17 @@ server {
 
         # Prefer HTTPS backend
         if ($prefer_https_port != 0) {
-            proxy_pass https://127.0.0.1:$prefer_https_port$rewritten_uri;
+            proxy_pass https://127.0.0.1:$prefer_https_port$rewritten_uri$is_args$args;
             break;
         }
 
         if ($port_https != 0) {
-            proxy_pass https://127.0.0.1:$port_https$rewritten_uri;
+            proxy_pass https://127.0.0.1:$port_https$rewritten_uri$is_args$args;
             break;
         }
 
         if ($port_http != 0) {
-            proxy_pass http://127.0.0.1:$port_http$rewritten_uri;
+            proxy_pass http://127.0.0.1:$port_http$rewritten_uri$is_args$args;
             break;
         }
 
