@@ -6,6 +6,9 @@
 # Static fallback:  /usr/share/nginx/html
 # ======================================================
 
+gzip_disable "msie6";
+gzip_vary on;
+
 # ------------------------------------------------------
 # User mapping
 # ------------------------------------------------------
@@ -24,15 +27,6 @@ map $host $legacy_map {
 map $http_range $is_range_request {
     default 0;
     "~bytes=" 1;
-}
-
-#gzip on; # already defined in nginx.conf
-gzip_disable "msie6";
-gzip_vary on;
-
-map $is_range_request $gzip_off {
-    1 off;
-    0 on;
 }
 
 map $is_range_request $proxy_buffering_mode {
@@ -55,11 +49,6 @@ map $host $is_pool_host {
     localhost              1;
 }
 
-map "$is_pool_host:$uri" $needs_domain_slash {
-    default 0;
-    ~^1:/[^/]+$ 1;
-}
-
 map "$is_pool_host:$host" $host_user {
     default "";
 
@@ -72,8 +61,13 @@ map "$pool_user:$host_user" $user {
     default      nginx;
 }
 
-map "$is_pool_host:$uri" $rewritten_uri {
-    default $uri;
+map "$is_pool_host:$request_uri" $needs_trailing_slash {
+    default 0;
+    ~^1:/[^/?]+$ 1;
+}
+
+map "$is_pool_host:$request_uri" $rewritten_uri {
+    default $request_uri;
     ~^1:/[^/]+(/.*)$ $1;
     ~^1:/[^/]+$      /;
 }
@@ -465,6 +459,10 @@ server {
     proxy_set_header X-Real-IP         $remote_addr;
     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
 
+    proxy_max_temp_file_size 0;
+    # proxy_buffering off;
+    # proxy_request_buffering off;
+    
     ssl_certificate     /etc/letsencrypt/live/pool.glitchr.dev/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/pool.glitchr.dev/privkey.pem;
 
@@ -493,18 +491,13 @@ server {
         root /var/www/letsencrypt;
     }
 
+    # ---------------------------------------------
+    # Pool canonicalization (MUST BE FIRST)
+    # ---------------------------------------------
+    merge_slashes on;
 
-    # --------------------------------------------------
-    # Pool first-path canonicalization (NO if)
-    # --------------------------------------------------
-    location ~ ^/[^/]+$ {
-
-        # Only act for pool / localhost
-        if ($needs_domain_slash = 0) {
-            return 404;
-        }
-
-        return 308 $scheme://$host$uri/;
+    if ($needs_trailing_slash) {
+        return 301 $scheme://$host$request_uri/;
     }
 
     # robots.txt
@@ -549,15 +542,13 @@ server {
     add_header X-Pool-Domain $pool_debug_domain always;
     add_header X-Pool-Script $pool_debug_script always;
     add_header X-Pool-Uri    $pool_debug_uri    always;
+    add_header X-Request-Uri "$request_uri" always;
+
     add_header X-Pool-Code   $pool_debug_code   always;
     add_header X-Pool-Socket $pool_debug_socket always;
     add_header X-Pool-Http   $pool_debug_http always;
     add_header X-Pool-Https  $pool_debug_https always;
     add_header X-Pool-Legacy $pool_debug_legacy always;
-    
-    add_header X-Debug-Args "$args" always;
-    add_header X-Debug-Request-Uri "$request_uri" always;
-    add_header X-Debug-Rewritten-Uri "$rewritten_uri" always;
 
     # ======================================================
     # DISPATCHER
@@ -637,17 +628,17 @@ server {
 
         # Prefer HTTPS backend
         if ($prefer_https_port != 0) {
-            proxy_pass https://127.0.0.1:$prefer_https_port$rewritten_uri$is_args$args;
+            proxy_pass https://127.0.0.1:$prefer_https_port$rewritten_uri;
             break;
         }
 
         if ($port_https != 0) {
-            proxy_pass https://127.0.0.1:$port_https$rewritten_uri$is_args$args;
+            proxy_pass https://127.0.0.1:$port_https$rewritten_uri;
             break;
         }
 
         if ($port_http != 0) {
-            proxy_pass http://127.0.0.1:$port_http$rewritten_uri$is_args$args;
+            proxy_pass http://127.0.0.1:$port_http$rewritten_uri;
             break;
         }
 
@@ -682,10 +673,10 @@ server {
 
         proxy_http_version 1.1;
 
+        gzip off;
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_cache off;
-        gzip off;
 
         proxy_set_header Range    $http_range;
         proxy_set_header If-Range $http_if_range;
