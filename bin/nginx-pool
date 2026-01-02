@@ -12,7 +12,7 @@
 #   nginx-pool acl <user> [domain]
 #   nginx-pool users
 #   nginx-pool domains
-#   nginx-pool symlinks
+#   nginx-pool symlinks [domain]
 #
 # Notes:
 # - Each virtual host maps to:
@@ -474,16 +474,16 @@ add_vhost() {
     setfacl -R -m u:www-data:rwx "/home/$user/www"
     setfacl -R -d -m u:www-data:rwx "/home/$user/www"
 
-    [[ -f "$base/index.html" ]] || cat > "$base/index.html" <<EOF
-<!DOCTYPE html>
-<html>
-<head><title>$domain</title></head>
-<body style="font-family:sans-serif;">
-<h1>Welcome to $domain</h1>
-<p>Served from <code>$site</code>.</p>
-</body>
-</html>
-EOF
+#     [[ -f "$base/index.html" ]] || cat > "$base/index.html" <<EOF
+# <!DOCTYPE html>
+# <html>
+# <head><title>$domain</title></head>
+# <body style="font-family:sans-serif;">
+# <h1>Welcome to $domain</h1>
+# <p>Served from <code>$site</code>.</p>
+# </body>
+# </html>
+# EOF
 
     echo
     echo -e "${GREEN}[✓] Virtual host ${CYAN}$domain${GREEN} created for ${CYAN}$user${GREEN}.${NC}"
@@ -498,12 +498,13 @@ EOF
     lock_vhost "$user" "$domain" > /dev/null
     fix_acl "$user" "$domain" > /dev/null
     users > /dev/null
+    update_symlinks > /dev/null
 
-    echo "[+] ACL permissions have been set."
-    echo "[-] Remember to configure your DNS to point ${CYAN}$user.$MASTER${NC} to $MASTER."
-    echo "[-] Then, obtain a certificate using certbot and/or extend-cert."
-    echo "[-] Finally, unlock the vhost using: \"nginx-pool unlock $user $domain\""
-    echo "[-] NGINX reload may be required to apply full changes."
+    echo -e "[+] ACL permissions have been set."
+    echo -e "[-] Remember to configure your DNS to point ${CYAN}$user.$MASTER${NC} to $MASTER."
+    echo -e "[-] Then, obtain a certificate using certbot and/or extend-cert: \"nginx-pool extend-cert $domain\""
+    echo -e "[-] Finally, unlock the vhost using: \"nginx-pool unlock $user $domain\""
+    echo -e "[-] NGINX reload may be required to apply full changes: \"nginx -s reload\""
 }
 
 is_docker_mapped_before() {
