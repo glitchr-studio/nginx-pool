@@ -13,7 +13,7 @@ DOMAIN_ESC2 := $(subst .,\\\.,$(DOMAIN))
 # ------------------------------------------------------
 # Template replacement task
 # ------------------------------------------------------
-build-config:
+config:
 	@sed -e "s/{{DOMAIN}}/$(DOMAIN_ESC)/g" \
 		 -e "s/{{DOMAIN_ESC}}/$(DOMAIN_ESC2)/g" \
 		 nginx.conf.template > nginx.conf
@@ -24,7 +24,7 @@ build-config:
 nginx:
 	@curl -fsSL https://nginx.org/keys/nginx_signing.key   | sudo gpg --dearmor -o /usr/share/keyrings/nginx-keyring.gpg
 	@echo -e "deb [signed-by=/usr/share/keyrings/nginx-keyring.gpg]\n http://nginx.org/packages/mainline/debian bookworm nginx" | tee /etc/apt/sources.list.d/nginx-mainline.list
-	@apt install nginx python3-certbot-nginx
+	@apt install nginx python3-certbot-nginx nginx-extras libpam0g-dev
 	@cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak || true
 	@cp nginx.conf /etc/nginx/
 
@@ -37,13 +37,13 @@ php:
 	             php8.3-bcmath php8.3-zip php8.3-sqlite3 php8.3-gd php8.3-opcache php3-igbinary php8.3-cli php8.3-igbinary
 	@update-alternatives --config php
 
-conf: build-config
+install: config
 	@cp bin/* /usr/local/bin/
 	@cp conf.d/* /etc/nginx/conf.d
-	@touch /etc/nginx/users.map /etc/nginx/legacy.map /etc/nginx/domains.map
-	@touch /etc/nginx/ports_http.map /etc/nginx/ports_https.map
-	@nginx -t
-	@systemctl restart nginx
+	@touch /etc/nginx/user.map /etc/nginx/legacy.map /etc/nginx/domain.map /etc/nginx/lock.map
+	@touch /etc/nginx/port_http.map /etc/nginx/port_https.map
+	@$(MAKE) reload
 
 reload:
+	@nginx -t
 	@systemctl restart nginx

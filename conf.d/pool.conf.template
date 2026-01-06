@@ -12,8 +12,12 @@ gzip_vary on;
 # ------------------------------------------------------
 # User mapping
 # ------------------------------------------------------
+map $host $canonical_path {
+    include /etc/nginx/domain.map;
+    default 0;
+}
 map $host $pool_user {
-    include /etc/nginx/users.map;
+    include /etc/nginx/user.map;
     default "";
 }
 map $host $legacy_map {
@@ -107,12 +111,12 @@ map "$entry_found $has_port" $extern_invalid {
     default 0;     # everything else
 }
 
-map $domain $port_http {
+map $host $port_http {
     default 0;
     include /etc/nginx/port_http.map;
 }
 
-map $domain $port_https {
+map $host $port_https {
     default 0;
     include /etc/nginx/port_https.map;
 }
@@ -526,9 +530,9 @@ server {
     # -------------------------------------------------
     # Resolve user/domain and filesystem roots
     # -------------------------------------------------
-    set $domain $host;
+    set $domain $canonical_path;
     if ($uri ~* ^/([^/]+)/?) { set $domain $1; }
-    if ($user = "$pool_user") { set $domain $host; }
+    if ($user = "$pool_user") { set $domain $canonical_path; }
     
     set $userland /home/$user/www;
 
@@ -556,9 +560,9 @@ server {
     location ^~ / {
 
         set $code 0;
-        if (!-d $userland) { return 418; }
-        if (!-d $webroot) { return 404; }
-        if ($domain = "") { return 404; }
+        if (!-d $userland) { return 404; }
+        if (!-d $webroot)  { return 404; }
+        if ($domain = "")  { return 404; }
        
         # Lock
         set $is_locked 0;
@@ -569,7 +573,7 @@ server {
         if (-e $socket) { return 590; }
 
         # Invalid extern: entry exists but both ports are zero → 404
-        if ($extern_invalid = 1) { return 404; }
+        if ($extern_invalid = 1) { return 418; }
         if ($has_streaming_port = 1) { return 597; }
         if ($has_port = 1) { return 591; }
         
@@ -765,7 +769,7 @@ server {
 
         sub_filter_once off;
         sub_filter '%%WEBROOT%%' '$webroot';
-        sub_filter '%%DOMAIN%%' '$domain';
+        sub_filter '%%DOMAIN%%' '$host';
 
         try_files $uri /index.html @nginx_default;
     }
