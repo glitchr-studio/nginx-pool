@@ -12,7 +12,7 @@
 #   nginx-pool acl <user> [domain]
 #   nginx-pool users
 #   nginx-pool domains
-#   nginx-pool symlinks [domain]
+#   nginx-pool symlinks
 #
 # Notes:
 # - Each virtual host maps to:
@@ -93,15 +93,16 @@ MASTER_REGEX=$(printf '%s\n' "${MASTER_DOMAINS[@]}" | sed 's/\./\\./g' | paste -
 # ---------- Colors ----------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[1;34m'
+GREEN_BOLD='\033[1;32m'
+YELLOW_BOLD='\033[1;33m'
+BLUE_BOLD='\033[1;34m'
 CYAN='\033[0;36m'
 GRAY='\033[0;37m'
 NC='\033[0m' # No Color / Reset
 
 # ---------- Helpers ----------
 usage() {
-    echo -e "${YELLOW}Usage:${NC}"
+    echo -e "${YELLOW_BOLD}Usage:${NC}"
     echo -e "  $0 add <user> <domain> [--master <domain>]"
     echo -e "  $0 list [--local] [--master <domain>]"
     echo -e "  $0 extend-cert <domain>"
@@ -115,11 +116,16 @@ usage() {
     echo -e "  $0 symlinks"
     echo -e "  $0 users"
     echo
-    echo -e "${BLUE}Examples:${NC}"
+    echo -e "${BLUE_BOLD}Examples:${NC}"
     echo -e "  $0 list --local --master pool.domain.com"
     echo -e "  $0 add alice example.com --master pool.domain.com"
     echo
     exit 1
+}
+
+fs_domain() {
+    IFS='.' read -ra parts <<< "$1"
+    printf "%s\n" "${parts[@]}" | tac | paste -sd'.' -
 }
 
 require_root() {
@@ -129,19 +135,32 @@ require_root() {
     fi
 }
 
-vhost_path() { echo "/home/$1/www/$2"; }
-vhost_lock_path() { echo "/home/$1/www/$2.lock"; }
+vhost_path() {
+    local user="$1"
+    local domain="$2"     # remains www.domain.com
+    local fs
+    fs=$(fs_domain "$domain")
+    echo "/home/$user/www/$fs"
+}
+
+vhost_lock_path() {
+    local user="$1"
+    local domain="$2"
+    local fs
+    fs=$(fs_domain "$domain")
+    echo "/home/$user/www/$fs.lock"
+}
 
 confirm() {
     local msg="$1"
-    read -rp "$(echo -e ${YELLOW}$msg${NC}) [y/N]: " yn
+    read -rp "$(echo -e ${YELLOW_BOLD}$msg${NC}) [y/N]: " yn
     [[ "$yn" =~ ^[Yy]$ ]]
 }
 
 create_user_if_missing() {
     local user="$1"
     if ! id "$user" &>/dev/null; then
-        echo -e "${BLUE}[+] Creating system user '${CYAN}$user${BLUE}'...${NC}"
+        echo -e "${BLUE_BOLD}[+] Creating system user '${CYAN}$user${BLUE_BOLD}'...${NC}"
         useradd -m -s /bin/bash -G www-data "$user"
         echo -e "${GREEN}[✓] Added to group www-data.${NC}"
     else
@@ -158,7 +177,7 @@ fix_acl() {
 
     # Handle global wildcard
     if [[ "$user" == "*" ]]; then
-        echo -e "${BLUE}[i] Applying ACL fix for ALL www-data users...${NC}"
+        echo -e "${BLUE_BOLD}[i] Applying ACL fix for ALL www-data users...${NC}"
         while IFS=: read -r name _; do
             if id -nG "$name" 2>/dev/null | grep -qw www-data; then
                 echo -e "${CYAN}→ $name${NC}"
@@ -170,7 +189,7 @@ fix_acl() {
 
     # Handle per-user wildcard
     if [[ "$domain" == "*" ]]; then
-        echo -e "${BLUE}[i] Applying ACL fix for all vhosts of ${CYAN}$user${BLUE}...${NC}"
+        echo -e "${BLUE_BOLD}[i] Applying ACL fix for all vhosts of ${CYAN}$user${BLUE_BOLD}...${NC}"
         local www="/home/$user/www"
         if [[ -d "$www" ]]; then
             find "$www" -mindepth 1 -maxdepth 1 -type d | while read -r dir; do
@@ -187,7 +206,7 @@ fix_acl() {
 
     [[ -d "$base" ]] || { echo -e "${RED}[!] No such vhost path: $base${NC}"; return; }
 
-    echo -e "${BLUE}[i] Fixing ACL for ${CYAN}$base${BLUE}...${NC}"
+    echo -e "${BLUE_BOLD}[i] Fixing ACL for ${CYAN}$base${BLUE_BOLD}...${NC}"
     chmod 700 "/home/$user"
     chmod 700 "$base" 2>/dev/null || true
     chown -R "$user:www-data" "/home/$user"
@@ -222,7 +241,7 @@ extend_cert() {
 
     # if [[ -z "$san_line" ]]; then
     #     echo -e "${RED}[!] No existing certificate found for ${CYAN}$cert_name${RED}.${NC}"
-    #     echo -e "${YELLOW}Create it first with certbot before using extend-cert.${NC}"
+    #     echo -e "${YELLOW_BOLD}Create it first with certbot before using extend-cert.${NC}"
     #     exit 1
     # fi
 
@@ -235,7 +254,7 @@ extend_cert() {
     # ============================================================
     # 2. Discover candidate domains from /home/<user>/www/<domain>
     # ============================================================
-    echo -e "${BLUE}[*] Discovering candidate domains...${NC}"
+    echo -e "${BLUE_BOLD}[*] Discovering candidate domains...${NC}"
     declare -A seen=()
     local candidates=()
 
@@ -294,7 +313,7 @@ extend_cert() {
         exit 1
     fi
 
-    echo -e "${BLUE}[*] Selected domains (after filtering):${NC}"
+    echo -e "${BLUE_BOLD}[*] Selected domains (after filtering):${NC}"
     for d in "${selected[@]}"; do
         echo -e "  • ${GREEN}$d${NC}"
     done
@@ -330,7 +349,7 @@ extend_cert() {
         return 0
     fi
 
-    echo -e "${BLUE}[*] New domains to be added to ${CYAN}$cert_name${BLUE}:${NC}"
+    echo -e "${BLUE_BOLD}[*] New domains to be added to ${CYAN}$cert_name${BLUE_BOLD}:${NC}"
     for d in "${new_domains[@]}"; do
         echo -e "  + ${GREEN}$d${NC}"
     done
@@ -339,7 +358,7 @@ extend_cert() {
     # ============================================================
     # 5. Call certbot with FULL SAN LIST (to avoid removals)
     # ============================================================
-    echo -e "${BLUE}[*] Calling Certbot (--expand) with merged SAN list...${NC}"
+    echo -e "${BLUE_BOLD}[*] Calling Certbot (--expand) with merged SAN list...${NC}"
 
     certbot certonly \
         --webroot -w "$webroot" \
@@ -359,7 +378,7 @@ extend_cert() {
 show_certs() {
     require_root
 
-    echo -e "${BLUE}[*] Listing all certificates managed by Certbot...${NC}"
+    echo -e "${BLUE_BOLD}[*] Listing all certificates managed by Certbot...${NC}"
     echo
 
     local current_name=""
@@ -379,7 +398,7 @@ show_certs() {
         if [[ $in_block -eq 1 ]]; then
             # Domains
             if [[ "$line" =~ ^\ \ Domains:\ (.*)$ ]]; then
-                echo -e "${GRAY}Domains:${NC}        ${YELLOW}${BASH_REMATCH[1]}${NC}"
+                echo -e "${GRAY}Domains:${NC}        ${YELLOW_BOLD}${BASH_REMATCH[1]}${NC}"
             fi
 
             # Expiry
@@ -417,7 +436,7 @@ show_certs() {
 cert_renew() {
     require_root
 
-    echo -e "${BLUE}[*] Forcing certificate renewal using Certbot...${NC}"
+    echo -e "${BLUE_BOLD}[*] Forcing certificate renewal using Certbot...${NC}"
     echo
 
     # Run certbot renew
@@ -431,7 +450,7 @@ cert_renew() {
     if [[ $status -ne 0 ]]; then
         echo
         echo -e "${RED}[✗] Certbot renewal failed!${NC}"
-        echo -e "${YELLOW}Check logs:${NC} /var/log/letsencrypt/letsencrypt.log"
+        echo -e "${YELLOW_BOLD}Check logs:${NC} /var/log/letsencrypt/letsencrypt.log"
         exit 1
     fi
 
@@ -444,13 +463,13 @@ cert_renew() {
         echo -e "${GREEN}[✓] Certificates successfully renewed.${NC}"
     fi
 
-    echo -e "${BLUE}[*] Reloading nginx...${NC}"
+    echo -e "${BLUE_BOLD}[*] Reloading nginx...${NC}"
     systemctl reload nginx
 
     if [[ $? -eq 0 ]]; then
         echo -e "${GREEN}[✓] NGINX reloaded successfully.${NC}"
     else
-        echo -e "${RED}[✗] Failed to reload NGINX — please check configuration!${NC}"
+        echo -e "${RED}[✗] Failed to reload NGINX - please check configuration!${NC}"
         exit 1
     fi
 
@@ -493,7 +512,7 @@ add_vhost() {
     echo -e "    ${GRAY}Lock file:    ${CYAN}${base}.lock${NC}"
     echo -e "    ${GRAY}URLs:${NC}"
     local EFFECTIVE_PORT=$([[ $PORT == 80 || $PORT == 443 ]] && echo "" || echo ":$PORT")
-    echo -e "      ${BLUE}https://$user.$MASTER${EFFECTIVE_PORT}/$domain/${NC}"
+    echo -e "      ${BLUE_BOLD}https://$user.$MASTER${EFFECTIVE_PORT}/$domain/${NC}"
 
     lock_vhost "$user" "$domain" > /dev/null
     fix_acl "$user" "$domain" > /dev/null
@@ -537,7 +556,7 @@ update_ports_map() {
     local tmp_http="${map_http}.tmp"
     local tmp_https="${map_https}.tmp"
 
-    echo -e "${BLUE}[*] Rebuilding ${CYAN}port_http.map${BLUE} and ${CYAN}port_https.map${BLUE}…${NC}"
+    echo -e "${BLUE_BOLD}[*] Rebuilding ${CYAN}port_http.map${BLUE_BOLD} and ${CYAN}port_https.map${BLUE_BOLD}…${NC}"
     # Load existing maps to know which domains were already present
     declare -A old_http_ports=()
     declare -A old_https_ports=()
@@ -599,19 +618,27 @@ update_ports_map() {
         id -nG "$user" 2>/dev/null | grep -qw www-data || continue
         local root="/home/$user/www"
         [[ -d "$root" ]] || continue
+        echo ""
+        local header="Processing user: $user"
+        local header_visible=$(echo -e "$header" | sed 's/\x1b\[[0-9;]*m//g')
+        local line_length=$((${#header_visible} + 2))
+        printf "+%s+\n" "$(printf '%0.s-' $(seq 1 $line_length))"
+        echo -e "| ${GREEN_BOLD}Processing user:${NC} ${CYAN}$user${NC} |"
+        printf "+%s+\n" "$(printf '%0.s-' $(seq 1 $line_length))"
 
         for dir in "$root"/*; do
             [[ -d "$dir" ]] || continue
 
-            local domain
-            domain=$(basename "$dir")
+            local domain fsname
+            fsname=$(basename "$dir")
+            domain=$(fs_domain "$fsname")
 
             [[ "$domain" =~ \.lock$ ]] && continue
 
             if [[ ${seen_domains[$domain]+_} ]]; then continue; fi
             seen_domains[$domain]=1
 
-            local project="${domain//./}"
+            local project="${fsname//./}"
             local proxy="${project}-proxy"
 
             local cid
@@ -626,19 +653,19 @@ update_ports_map() {
             fi
 
             if [[ -z "$cid" ]]; then
-                echo -e "${YELLOW}[!] Missing proxy container for ${CYAN}$domain${YELLOW} (expected: ${CYAN}${proxy}${YELLOW})${NC}"
 
+                echo -e "| ${YELLOW_BOLD}[!] Missing proxy container for ${CYAN}$domain${YELLOW_BOLD} (app: ${CYAN}${proxy}${YELLOW_BOLD})${NC}"
                 if is_docker_mapped_before "$domain"; then
                     if [[ "$KEEP_MISSING_PORTS" == true ]]; then
-                        echo -e "${CYAN}    Preserving docker entry for ${domain} with ports=0${NC}"
+                        echo -e "| ${CYAN}    Preserving external ports for ${domain}${NC} in ${CYAN}$dir${NC} (docker not running?)"
                         printf "%s 0; #docker\n" "$domain" >> "$tmp_http"
                         printf "%s 0; #docker\n" "$domain" >> "$tmp_https"
                     else
-                        echo -e "${YELLOW}[i] Removing docker entry for ${domain}${NC}"
+                        echo -e "| ${YELLOW_BOLD}[i] Removing docker entry for ${domain}${NC}"
                     fi
                 else
 
-                    echo -e "${BLUE}[i] ${domain} is manual — preserving existing ports${NC}"
+                    echo -e "| ${CYAN}    ${domain}${BLUE_BOLD} runs natively from${NC} ${CYAN}$dir${NC}"
 
                     # preserve HTTP
                     if [[ -n "${old_http_ports[$domain]+x}" ]]; then
@@ -661,7 +688,7 @@ update_ports_map() {
                 http_port=$(extract_port "$ports" "80/tcp")
                 https_port=$(extract_port "$ports" "443/tcp")
 
-                echo -e "Port mapping for ${CYAN}$domain${NC} detected: HTTP=${GREEN}${http_port}${NC}, HTTPS=${GREEN}${https_port}${NC}"
+                echo -e "| ${GREEN_BOLD}[✓] External port(s) for${NC} ${CYAN}$domain${NC}${GREEN_BOLD} detected:${NC} HTTP=${GREEN}${http_port}${NC}, HTTPS=${GREEN}${https_port}${NC} (in ${CYAN}$dir)${NC}"
             fi
 
             # If docker container exists (EXTERN backend), ALWAYS write both entries.
@@ -686,6 +713,8 @@ update_ports_map() {
 
         done
 
+        printf "+%s+\n" "$(printf '%0.s-' $(seq 1 $line_length))"
+
     done < <(getent passwd)
 
     # ======================================================
@@ -707,12 +736,13 @@ update_ports_map() {
         rm -f "$tmp_https"
     fi
 
+    echo ""
     if [[ $changed -eq 1 ]]; then
         echo -e "${GREEN}[✓] Maps updated.${NC}"
-        echo -e "${YELLOW}Reloading nginx (changes detected)…${NC}"
+        echo -e "${YELLOW_BOLD}Reloading nginx (changes detected)…${NC}"
         systemctl reload nginx
     else
-        echo -e "${CYAN}[i] No changes detected — NGINX not reloaded.${NC}"
+        echo -e "${CYAN}[i] No changes detected - NGINX not reloaded.${NC}"
     fi
 }
 
@@ -720,10 +750,10 @@ users() {
 
     require_root
 
-    local map_file="/etc/nginx/users.map"
+    local map_file="/etc/nginx/user.map"
     local tmp_file="${map_file}.tmp"
 
-    echo -e "${BLUE}[*] Rebuilding NGINX user → domain map...${NC}"
+    echo -e "${BLUE_BOLD}[*] Rebuilding NGINX user → domain map...${NC}"
 
     # Header
     {
@@ -746,21 +776,22 @@ users() {
             for d in "$root"/*; do
                 [[ -d "$d" ]] || continue
 
-                local domain
-                domain=$(basename "$d")
-
+                local domain fsname
+                fsname=$(basename "$d")
+                domain=$(fs_domain "$fsname")
+                
                 # skip lock
                 [[ "$domain" =~ \.lock$ ]] && continue
 
                 # dedupe
                 if [[ -n "${seen_domains[$domain]:-}" ]]; then
-                    echo -e "${YELLOW}[!] Duplicate domain skipped:${NC} ${CYAN}$domain${NC}"
+                    echo -e "${YELLOW_BOLD}[!] Duplicate domain skipped:${NC} ${CYAN}$domain${NC}"
                     continue
                 fi
                 seen_domains[$domain]="$name"
 
                 printf "%s\t%s;\n" "$domain" "$name" >> "$tmp_file"
-                echo -e "${CYAN}→ ${GREEN}$domain${NC} mapped to ${BLUE}$name${NC}"
+                echo -e "${CYAN}→ ${GREEN}$domain${NC} mapped to ${BLUE_BOLD}$name${NC}"
 
                 total_entries=$((total_entries + 1))
             done
@@ -778,14 +809,14 @@ users() {
 
         echo
         echo -e "${GREEN}[✓] Updated: ${CYAN}$map_file${NC} (${total_entries} entries)."
-        echo -e "${YELLOW}Reloading nginx…${NC}"
+        echo -e "${YELLOW_BOLD}Reloading nginx…${NC}"
         systemctl reload nginx
     else
         # same → no update needed
         rm -f "$tmp_file"
 
         echo
-        echo -e "${CYAN}[i] No changes detected — ${map_file} unchanged.${NC}"
+        echo -e "${CYAN}[i] No changes detected - ${map_file} unchanged.${NC}"
         echo -e "${CYAN}[i] NGINX not reloaded.${NC}"
     fi
 }
@@ -876,7 +907,7 @@ update_symlinks() {
     local symlink_root="/var/www/pool"
     mkdir -p "$symlink_root"
 
-    echo -e "${BLUE}[*] Updating symlinks under ${CYAN}$symlink_root${BLUE}...${NC}"
+    echo -e "${BLUE_BOLD}[*] Updating symlinks under ${CYAN}$symlink_root${BLUE_BOLD}...${NC}"
 
     declare -A valid_domains=()
     local total=0
@@ -891,14 +922,14 @@ update_symlinks() {
             for d in "$root"/*; do
                 [[ -d "$d" ]] || continue
 
-                local domain
-                domain=$(basename "$d")
+                local domain fsname
+                fsname=$(basename "$d")
+                domain=$(fs_domain "$fsname")
 
                 [[ "$domain" =~ \.lock$ ]] && continue
 
                 valid_domains["$domain"]="$d"
-
-                local link="$symlink_root/$domain"
+                local link="$symlink_root/$fsname"
 
                 # Stale symlink
                 if [[ -L "$link" && ! -e "$link" ]]; then
@@ -915,7 +946,7 @@ update_symlinks() {
                     local actual
                     actual=$(readlink -f "$link")
                     if [[ "$actual" != "$d" ]]; then
-                        echo -e "${YELLOW}[i] Fixing symlink: ${CYAN}$link${NC}"
+                        echo -e "${YELLOW_BOLD}[i] Fixing symlink: ${CYAN}$link${NC}"
                         rm -f "$link"
                         ln -s "$d" "$link"
                     fi
@@ -929,11 +960,12 @@ update_symlinks() {
     # -------- Remove orphans --------
     for s in "$symlink_root"/*; do
         [[ -L "$s" ]] || continue
-        local domain
-        domain=$(basename "$s")
+        local domain fsname
+        fsname=$(basename "$s")
+        domain=$(fs_domain "$fsname")
 
         if [[ -z "${valid_domains[$domain]:-}" ]]; then
-            echo -e "${YELLOW}[i] Removing orphan symlink: $s${NC}"
+            echo -e "${YELLOW_BOLD}[i] Removing orphan symlink: $s${NC}"
             rm -f "$s"
         fi
     done
@@ -947,16 +979,16 @@ update_domains() {
 
     require_root
 
-    local map_file="/etc/nginx/domains.conf"
+    local map_file="/etc/nginx/domain.map"
     local tmp_file="${map_file}.tmp"
 
-    echo -e "${BLUE}[*] Updating domain canonicalization map...${NC}"
+    echo -e "${BLUE_BOLD}[*] Updating domain canonicalization map...${NC}"
 
     {
         echo "# Auto-generated by nginx-pool"
         echo "# Canonical domain aliases"
         echo "# Format:"
-        echo "#   <alias> <canonical>;"
+        echo "#   <domain> <canonical>;"
         echo
     } > "$tmp_file"
 
@@ -973,8 +1005,9 @@ update_domains() {
             for d in "$root"/*; do
                 [[ -d "$d" ]] || continue
 
-                local canonical
-                canonical="$(basename "$d")"
+                local fsname canonical
+                fsname="$(basename "$d")"
+                canonical="$(fs_domain "$fsname")"
 
                 [[ "$canonical" =~ \.lock$ ]] && continue
 
@@ -989,7 +1022,7 @@ update_domains() {
                 [[ -n "${valid_aliases[$alias]:-}" ]] && continue
                 valid_aliases["$alias"]="$canonical"
 
-                printf "%-40s %s;\n" "$alias" "$canonical" >> "$tmp_file"
+                printf "%-40s %s;\n" "$canonical" "$alias" >> "$tmp_file"
                 echo -e "${CYAN}→ ${alias}${NC} → ${GREEN}${canonical}${NC}"
 
                 total=$((total + 1))
@@ -1002,12 +1035,12 @@ update_domains() {
         mv "$tmp_file" "$map_file"
         echo
         echo -e "${GREEN}[✓] Updated ${CYAN}$map_file${GREEN} (${total} aliases).${NC}"
-        echo -e "${YELLOW}Reloading nginx…${NC}"
+        echo -e "${YELLOW_BOLD}Reloading nginx…${NC}"
         systemctl reload nginx
     else
         rm -f "$tmp_file"
         echo
-        echo -e "${CYAN}[i] No changes detected — nginx not reloaded.${NC}"
+        echo -e "${CYAN}[i] No changes detected - nginx not reloaded.${NC}"
     fi
 }
 
@@ -1015,7 +1048,7 @@ list_vhosts() {
     local filter_user="${1:-*}"
     local show_local_urls="${2:-$SHOW_LOCALS}"
 
-    echo -e "${BLUE}[*] Listing pool virtual hosts (www-data members):${NC}"
+    echo -e "${BLUE_BOLD}[*] Listing pool virtual hosts (www-data members):${NC}"
     echo -e "----------------------------------------------------------------------------------------------------------------"
     if [[ "$show_local_urls" == "true" ]]; then
         local="LOCAL URL"
@@ -1044,7 +1077,7 @@ list_vhosts() {
         total_users=$((total_users + 1))
         local www_dir="/home/$user/www"
         if [[ ! -d "$www_dir" ]]; then
-            echo -e "${YELLOW}[!] ${CYAN}$user${YELLOW}: no www directory found.${NC}"
+            echo -e "${YELLOW_BOLD}[!] ${CYAN}$user${YELLOW_BOLD}: no www directory found.${NC}"
             continue
         fi
         if [[ ! -r "$www_dir" ]]; then
@@ -1057,8 +1090,9 @@ list_vhosts() {
             [[ -d "$domain_dir" ]] || continue
             found=1
             total_domains=$((total_domains + 1))
+            
             local domain lock status output
-            domain=$(basename "$domain_dir")
+            domain=$(fs_domain "$(basename "$domain_dir")")
             lock="$domain_dir.lock"
 
             if [[ "$SHOW_BACKEND" == true ]]; then
@@ -1101,7 +1135,7 @@ lock_vhost() {
     [[ -d $(vhost_path "$user" "$domain") ]] || { echo -e "${RED}[!] No such vhost: $user/$domain${NC}"; exit 1; }
 
     touch "$lock"
-    echo -e "${YELLOW}[−] Locked ${CYAN}$user/$domain${YELLOW}.${NC}"
+    echo -e "${YELLOW_BOLD}[−] Locked ${CYAN}$user/$domain${YELLOW_BOLD}.${NC}"
 }
 
 unlock_vhost() {
@@ -1112,7 +1146,7 @@ unlock_vhost() {
         rm -f "$lock"
         echo -e "${GREEN}[✓] Unlocked ${CYAN}$user/$domain${GREEN}.${NC}"
     else
-        echo -e "${YELLOW}[i] Already unlocked.${NC}"
+        echo -e "${YELLOW_BOLD}[i] Already unlocked.${NC}"
     fi
 }
 
