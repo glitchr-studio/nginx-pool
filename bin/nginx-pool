@@ -6,9 +6,11 @@
 #   nginx-pool add <user> <domain> [--master <cert>] [--extend-cert]
 #   nginx-pool cert <domain> [--master <cert_family>]
 #   nginx-pool list [--local] [--backend]
-#   nginx-pool certs
+#   nginx-pool certs [<user>]
 #   nginx-pool renew
 #   nginx-pool ssl-map
+#   nginx-pool rev add|remove|show|list|apply  (alias: reverse)
+#   nginx-pool reverses [<filter>]             (shortcut for: rev list)
 #   nginx-pool lock <user> <domain>
 #   nginx-pool unlock <user> <domain>
 #   nginx-pool remove <user> [domain]
@@ -59,9 +61,21 @@ PORT=$(awk '/listen/ && /ssl/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) print $i}
 MASTER="localhost"
 SHOW_LOCALS=false
 SHOW_BACKEND=false
-KEEP_MISSING_PORTS=false
+CLEAR_PORTS=false
 IS_DEDICATED=false
 EXTEND_CERT=false
+
+# Reverse proxy flags
+REVERSE_CERT=""
+REVERSE_NO_SSL_VERIFY=0
+REVERSE_NOINDEX=1
+REVERSE_NO_APPLY=false
+REVERSE_WS=1
+
+# Reverse proxy paths
+REVERSE_DIR="/var/www/nginx/reverses"
+REVERSE_CONF_SRC="/var/www/nginx/conf.d/reverses.conf"
+REVERSE_CONF_DST="/etc/nginx/conf.d/reverses.conf"
 
 # ---------- Parse flags ----------
 ARGS=()
@@ -79,10 +93,8 @@ while [[ $# -gt 0 ]]; do
             SHOW_BACKEND=true
             shift
             ;;
-        --preserve ) KEEP_MISSING_PORTS=true; shift ;;
-        --no-delete) KEEP_MISSING_PORTS=true; shift ;;
-        --keep-missing-ports)
-            KEEP_MISSING_PORTS=true
+        --clear-ports)
+            CLEAR_PORTS=true
             shift
             ;;
         --dedicated)
@@ -95,6 +107,34 @@ while [[ $# -gt 0 ]]; do
             ;;
         --wildcard)
             IS_WILDCARD=true
+            shift
+            ;;
+        --cert)
+            REVERSE_CERT="${2:-}"
+            shift 2
+            ;;
+        --no-ssl-verify)
+            REVERSE_NO_SSL_VERIFY=1
+            shift
+            ;;
+        --noindex|--no-index)
+            REVERSE_NOINDEX=1
+            shift
+            ;;
+        --index)
+            REVERSE_NOINDEX=0
+            shift
+            ;;
+        --no-apply)
+            # kept for backward compat — apply now always runs
+            shift
+            ;;
+        --ws)
+            REVERSE_WS=1
+            shift
+            ;;
+        --no-ws)
+            REVERSE_WS=0
             shift
             ;;
         *)
@@ -121,52 +161,65 @@ NC='\033[0m' # No Color / Reset
 
 # ---------- Helpers ----------
 usage() {
+    local me; me=$(basename "$0")
     echo -e "${YELLOW_BOLD}Usage:${NC}"
     echo -e "  ${GREEN}Domain Management:${NC}"
-    echo -e "    $0 add <user> <domain> [--master <cert>] [--extend-cert]"
-    echo -e "    $0 remove <user> [domain]"
-    echo -e "    $0 lock <user> <domain>"
-    echo -e "    $0 unlock <user> <domain>"
-    echo -e "    $0 list [--local] [--backend]"
+    echo -e "    $me add <user> <domain> [--master <cert>] [--extend-cert]"
+    echo -e "    $me remove <user> [domain]"
+    echo -e "    $me lock <user> <domain>"
+    echo -e "    $me unlock <user> <domain>"
+    echo -e "    $me list [--local] [--backend]"
     echo
     echo -e "  ${GREEN}SSL Certificate Management:${NC}"
-    echo -e "    $0 cert <domain> [--master <cert_family>]   # Create/extend certificate for existing domain"
-    echo -e "    $0 certs                                    # View all certificates"
-    echo -e "    $0 renew                                    # Renew all certificates (for cron)"
-    echo -e "    $0 ssl-map                                  # Rebuild ssl_cert.map (rarely needed)"
+    echo -e "    $me cert <domain> [--master <cert_family>]            # Create/extend cert for domain"
+    echo -e "    $me certs [<user>]                                    # View certs (all, or scoped to user)"
+    echo -e "    $me renew                                             # Renew all certs (cron-safe)"
+    echo -e "    $me ssl-map                                           # Rebuild ssl_cert.map"
+    echo
+    echo -e "  ${GREEN}Reverse Proxy Management:${NC} ${GRAY}('rev' is a shorthand for 'reverse')${NC}"
+    echo -e "    $me reverses [<filter>]                               # List all reverse proxies (quick shortcut)"
+    echo -e "    $me rev add <domain> <backend> [opts]                 # Add / update a reverse proxy"
+    echo -e "        --cert <name>       override cert (auto-detected otherwise)"
+    echo -e "        --no-ssl-verify     skip TLS verification to backend (self-signed)"
+    echo -e "        --index             allow indexing (default: noindex)"
+    echo -e "        --ws                enable WebSocket upgrade headers (default: off)"
+    echo -e "    $me rev show <domain>                                 # Show entry details"
+    echo -e "    $me rev remove <domain>                               # Remove a reverse proxy"
+    echo -e "    $me rev apply                                         # Rebuild reverses.conf + reload nginx"
     echo
     echo -e "  ${GREEN}System Management:${NC}"
-    echo -e "    $0 users                                    # Rebuild user.map"
-    echo -e "    $0 domains                                  # Rebuild domain.map"
-    echo -e "    $0 symlinks                                 # Update symlinks in /var/www/pool"
-    echo -e "    $0 ports                                    # Rebuild port maps for Docker backends"
-    echo -e "    $0 acl <user> [domain]                      # Fix ACL permissions"
+    echo -e "    $me users                                    # Rebuild user.map"
+    echo -e "    $me domains                                  # Rebuild domain.map"
+    echo -e "    $me symlinks                                 # Update symlinks in /var/www/pool"
+    echo -e "    $me ports [--clear-ports]                    # Rebuild port maps for Docker backends"
+    echo -e "    $me acl <user> [domain]                      # Fix ACL permissions"
     echo
     echo -e "${BLUE_BOLD}Examples:${NC}"
     echo
-    echo -e "  ${GRAY}# For existing domains - just manage certificates:${NC}"
-    echo -e "  $0 cert m.apfelschorlette.fr --master apfelschorlette.fr"
-    echo -e "  $0 cert www.apfelschorlette.fr --master apfelschorlette.fr"
-    echo -e "  $0 cert www.chapaland.com"
-    echo -e "  ${GRAY}# Auto-detects user from existing directory${NC}"
+    echo -e "  ${GRAY}# Manage certificates:${NC}"
+    echo -e "  $me cert m.apfelschorlette.fr --master apfelschorlette.fr"
+    echo -e "  $me certs                                     ${GRAY}# all certs${NC}"
+    echo -e "  $me certs apfelschorlette                     ${GRAY}# certs covering apfelschorlette's domains${NC}"
     echo
-    echo -e "  ${GRAY}# For new domains - add with optional certificate:${NC}"
-    echo -e "  $0 add alice newdomain.com                              ${GRAY}# HTTP only${NC}"
-    echo -e "  $0 add alice newdomain.com --extend-cert                ${GRAY}# With standalone cert${NC}"
-    echo -e "  $0 add alice newdomain.com --master example.com --extend-cert  ${GRAY}# With family cert${NC}"
+    echo -e "  ${GRAY}# New pool vhost with cert:${NC}"
+    echo -e "  $me add alice newdomain.com --extend-cert"
+    echo -e "  $me add alice newdomain.com --master example.com --extend-cert"
+    echo -e "  $me add georges myapp --master pool.glitchr.dev  ${GRAY}# → https://georges.pool.glitchr.dev/myapp/${NC}"
     echo
-    echo -e "  ${GRAY}# Pool domain (development):${NC}"
-    echo -e "  $0 add georges myapp --master pool.glitchr.dev"
-    echo -e "  ${GRAY}# Access: https://georges.pool.glitchr.dev/myapp/${NC}"
-    echo
-    echo -e "  ${GRAY}# View certificates:${NC}"
-    echo -e "  $0 certs"
+    echo -e "  ${GRAY}# Reverse proxies:${NC}"
+    echo -e "  $me reverses                                   ${GRAY}# list all${NC}"
+    echo -e "  $me reverses carl                              ${GRAY}# filter by 'carl'${NC}"
+    echo -e "  $me rev add carl.glitchr.dev https://192.168.92.3 --no-ssl-verify --cert carl.glitchr.dev"
+    echo -e "  $me rev add nas.glitchr.dev  https://192.168.92.3:5001 --no-ssl-verify"
+    echo -e "  $me rev add chat.glitchr.dev http://127.0.0.1:3000 --ws"
+    echo -e "  $me rev apply                                  ${GRAY}# rebuild conf + reload nginx${NC}"
     echo
     echo -e "${BLUE_BOLD}Notes:${NC}"
-    echo -e "  ${GRAY}• Use 'cert' command for existing domains (auto-detects user)${NC}"
-    echo -e "  ${GRAY}• Use 'add' command for new domains (requires user)${NC}"
-    echo -e "  ${GRAY}• Certificates are opt-in with --extend-cert flag${NC}"
-    echo -e "  ${GRAY}• Use --master to group related domains under one certificate${NC}"
+    echo -e "  ${GRAY}• Use 'cert' for existing domains, 'add' for new ones${NC}"
+    echo -e "  ${GRAY}• --extend-cert is opt-in; preserves all existing SANs before adding new domain${NC}"
+    echo -e "  ${GRAY}• --master groups domains under one certificate family${NC}"
+    echo -e "  ${GRAY}• reverse entries are stored in $REVERSE_DIR/ (reversed domain names, no extension)${NC}"
+    echo -e "  ${GRAY}• reverse apply writes $REVERSE_CONF_DST and reloads nginx${NC}"
     echo
     exit 1
 }
@@ -417,6 +470,55 @@ fix_letsencrypt_permissions() {
     echo -e "${GREEN}[✓] ACL permissions set${NC}"
 }
 
+# Read the SAN list for an existing certificate.
+# Uses openssl (most reliable) → renewal [[webroot_map]] → certbot output, in that order.
+# Prints one domain per line. Returns 1 with a message if cert exists but SANs can't be read.
+read_cert_sans() {
+    local cert_name="$1"
+    local live_dir="/etc/letsencrypt/live/$cert_name"
+
+    [[ -d "$live_dir" ]] || return 0   # cert doesn't exist yet — not an error
+
+    local cert_pem="$live_dir/cert.pem"
+
+    # Method 1: openssl directly from the cert file (fastest, version-agnostic)
+    if [[ -f "$cert_pem" ]]; then
+        local sans
+        sans=$(openssl x509 -noout -text -in "$cert_pem" 2>/dev/null \
+               | awk '/Subject Alternative Name/{getline; gsub(/DNS:|[[:space:]]/,""); gsub(/,/,"\n"); print}' \
+               | grep -v '^$')
+        if [[ -n "$sans" ]]; then echo "$sans"; return 0; fi
+    fi
+
+    # Method 2: [[webroot_map]] section in renewal config (certbot webroot certs)
+    local renewal_conf="/etc/letsencrypt/renewal/${cert_name}.conf"
+    if [[ -f "$renewal_conf" ]] && grep -q '^\[\[webroot_map\]\]' "$renewal_conf" 2>/dev/null; then
+        local doms
+        doms=$(sed -n '/^\[\[webroot_map\]\]/,/^\[/p' "$renewal_conf" \
+               | grep ' = ' | sed 's/[[:space:]]*=.*//' | sed 's/^[[:space:]]*//' | grep -v '^$')
+        if [[ -n "$doms" ]]; then echo "$doms"; return 0; fi
+    fi
+
+    # Method 3: certbot certificates output (handles all authenticators)
+    local san_line
+    san_line=$(certbot certificates --cert-name "$cert_name" 2>/dev/null \
+               | awk '/^[[:space:]]+Domains:/ {
+                   sub(/^[[:space:]]+Domains:[[:space:]]*/,""); line=$0
+                   while ((getline l) > 0 && l ~ /^[[:space:]]+[a-zA-Z0-9]/) {
+                       sub(/^[[:space:]]*/,"",l); line=line" "l
+                   }
+                   print line; exit
+               }')
+    if [[ -n "$san_line" ]]; then
+        echo "$san_line" | tr ' ' '\n' | grep -v '^$'
+        return 0
+    fi
+
+    echo -e "${RED}[!] Cannot read SANs for cert '${cert_name}'.${NC}" >&2
+    echo -e "${YELLOW_BOLD}    Verify manually: certbot certificates --cert-name $cert_name${NC}" >&2
+    return 1
+}
+
 manage_cert_for_existing_domain() {
     require_root
 
@@ -497,14 +599,11 @@ create_ssl_cert() {
         echo
         read -rp "$(echo -e ${YELLOW_BOLD}Extend this certificate to include $domain?${NC}) [y/N]: " yn
         if [[ "$yn" =~ ^[Yy]$ ]]; then
-            # Get existing domains
-            local san_line
-            san_line=$(certbot certificates --cert-name "$cert_name" 2>/dev/null \
-                      | awk '/^[[:space:]]+Domains:/ {sub(/^[[:space:]]+Domains:[[:space:]]*/, "", $0); print; exit}')
-
             local domains=()
-            IFS=' ' read -r -a existing_domains <<< "$san_line"
-            domains=("${existing_domains[@]}")
+            while IFS= read -r _d; do domains+=("$_d"); done < <(read_cert_sans "$cert_name") || return 1
+            if [[ ${#domains[@]} -eq 0 && -d "/etc/letsencrypt/live/$cert_name" ]]; then
+                echo -e "${RED}[!] Cannot extend — SANs unreadable. Aborting.${NC}"; return 1
+            fi
 
             # Add new domain if not present
             local found=0
@@ -620,14 +719,12 @@ extend_domain_to_family_cert() {
 
     echo -e "${BLUE_BOLD}[*] Extending certificate ${CYAN}$family_cert${BLUE_BOLD} to include ${CYAN}$domain${BLUE_BOLD}...${NC}"
 
-    # Get existing domains in certificate
-    local san_line
-    san_line=$(certbot certificates --cert-name "$family_cert" 2>/dev/null \
-              | awk '/^[[:space:]]+Domains:/ {sub(/^[[:space:]]+Domains:[[:space:]]*/, "", $0); print; exit}')
-
     local domains=()
-    IFS=' ' read -r -a existing_domains <<< "$san_line"
-    domains=("${existing_domains[@]}")
+    while IFS= read -r _d; do domains+=("$_d"); done < <(read_cert_sans "$family_cert") || return 1
+    if [[ ${#domains[@]} -eq 0 && -d "/etc/letsencrypt/live/$family_cert" ]]; then
+        echo -e "${RED}[!] Cannot extend '${family_cert}' — SANs unreadable. Aborting to avoid overwriting.${NC}"
+        return 1
+    fi
 
     # Check if domain already in certificate
     local found=0
@@ -719,17 +816,12 @@ extend_cert() {
     # ============================================================
     # 1. Load existing SAN list for this certificate
     # ============================================================
-    local san_line
-    san_line=$(certbot certificates --cert-name "$cert_name" 2>/dev/null \
-              | awk '/^[[:space:]]+Domains:/ {sub(/^[[:space:]]+Domains:[[:space:]]*/, "", $0); print; exit}')
-
-    # if [[ -z "$san_line" ]]; then
-    #     echo -e "${RED}[!] No existing certificate found for ${CYAN}$cert_name${RED}.${NC}"
-    #     echo -e "${YELLOW_BOLD}Create it first with certbot before using extend-cert.${NC}"
-    #     exit 1
-    # fi
-
-    IFS=' ' read -r -a current_san <<< "$san_line"
+    local current_san=()
+    while IFS= read -r _d; do current_san+=("$_d"); done < <(read_cert_sans "$cert_name") || exit 1
+    if [[ ${#current_san[@]} -eq 0 && -d "/etc/letsencrypt/live/$cert_name" ]]; then
+        echo -e "${RED}[!] Cannot extend '${cert_name}' — SANs unreadable. Aborting to avoid overwriting.${NC}"
+        exit 1
+    fi
     declare -A present=()
     for d in "${current_san[@]}"; do
         present["$d"]=1
@@ -963,6 +1055,11 @@ cert_renew() {
     echo
     fix_letsencrypt_permissions
 
+    # Rebuild SSL cert map so any new/changed certs are picked up
+    echo
+    echo -e "${BLUE_BOLD}[*] Rebuilding SSL certificate map...${NC}"
+    update_ssl_map
+
     # Reload NGINX
     echo
     echo -e "${BLUE_BOLD}[*] Reloading NGINX...${NC}"
@@ -1150,7 +1247,7 @@ update_ports_map() {
     declare -A old_https_ports=()
 
     if [[ -f "$map_http" ]]; then
-        while read -r dom port; do
+        while read -r dom port _rest; do
             # skip comments and empty lines
             [[ -z "$dom" || "$dom" =~ ^# ]] && continue
             port="${port%;}"
@@ -1159,7 +1256,7 @@ update_ports_map() {
     fi
 
     if [[ -f "$map_https" ]]; then
-        while read -r dom port; do
+        while read -r dom port _rest; do
             [[ -z "$dom" || "$dom" =~ ^# ]] && continue
             port="${port%;}"
             old_https_ports["$dom"]="$port"
@@ -1187,7 +1284,9 @@ update_ports_map() {
     extract_port() {
         local ports="$1"
         local proto="$2"
+        local cid="${3:-}"
         local port=""
+        local port_num="${proto%%/*}"   # 80 or 443
 
         port=$(echo "$ports" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+->'"$proto" \
                          | sed -E 's/.*:([0-9]+)->.*/\1/' | head -n1)
@@ -1197,6 +1296,12 @@ update_ports_map() {
 
         [[ -n "$port" ]] || port=$(echo "$ports" | grep -oE "$proto"' -> [^,]+' \
                          | sed -E 's/.*:([0-9]+).*/\1/' | head -n1)
+
+        # Fallback: use 'docker port' which is reliable regardless of network mode / format
+        if [[ ( -z "$port" || "$port" == "0" ) && -n "$cid" ]]; then
+            port=$(docker port "$cid" "$port_num" 2>/dev/null \
+                   | grep -oE ':[0-9]+$' | sed 's/://' | head -n1)
+        fi
 
         echo "${port:-0}"
     }
@@ -1244,12 +1349,14 @@ update_ports_map() {
 
                 echo -e "| ${YELLOW_BOLD}[!] Missing proxy container for ${CYAN}$domain${YELLOW_BOLD} (app: ${CYAN}${proxy}${YELLOW_BOLD})${NC}"
                 if is_docker_mapped_before "$domain"; then
-                    if [[ "$KEEP_MISSING_PORTS" == true ]]; then
-                        echo -e "| ${CYAN}    Preserving external ports for ${domain}${NC} in ${CYAN}$dir${NC} (docker not running?)"
-                        printf "%s 0; #docker\n" "$domain" >> "$tmp_http"
-                        printf "%s 0; #docker\n" "$domain" >> "$tmp_https"
+                    if [[ "$CLEAR_PORTS" == true ]]; then
+                        echo -e "| ${YELLOW_BOLD}[i] Clearing docker entry for ${domain}${NC}"
                     else
-                        echo -e "| ${YELLOW_BOLD}[i] Removing docker entry for ${domain}${NC}"
+                        local preserved_http="${old_http_ports[$domain]:-0}"
+                        local preserved_https="${old_https_ports[$domain]:-0}"
+                        echo -e "| ${CYAN}    Preserving last known ports for ${domain}${NC} (docker not running?) HTTP=${GREEN}${preserved_http}${NC}, HTTPS=${GREEN}${preserved_https}${NC}"
+                        printf "%s %s; #docker\n" "$domain" "$preserved_http" >> "$tmp_http"
+                        printf "%s %s; #docker\n" "$domain" "$preserved_https" >> "$tmp_https"
                     fi
                 else
 
@@ -1273,31 +1380,37 @@ update_ports_map() {
                 local ports
                 ports=$(docker ps --filter "id=$cid" --format '{{.Ports}}')
 
-                http_port=$(extract_port "$ports" "80/tcp")
-                https_port=$(extract_port "$ports" "443/tcp")
+                http_port=$(extract_port "$ports" "80/tcp"  "$cid")
+                https_port=$(extract_port "$ports" "443/tcp" "$cid")
 
                 echo -e "| ${GREEN_BOLD}[✓] External port(s) for${NC} ${CYAN}$domain${NC}${GREEN_BOLD} detected:${NC} HTTP=${GREEN}${http_port}${NC}, HTTPS=${GREEN}${https_port}${NC} (in ${CYAN}$dir)${NC}"
+                if [[ "$http_port" == "0" && "$https_port" == "0" ]]; then
+                    echo -e "| ${YELLOW_BOLD}[!] Both ports are 0 for ${CYAN}$domain${YELLOW_BOLD} — container running but not exposing ports → will return 418${NC}"
+                fi
             fi
 
-            # If docker container exists (EXTERN backend), ALWAYS write both entries.
-            # Missing ports become 0.
-            if [[ -n "$cid" ]]; then
-                if [[ "$http_port" =~ ^[0-9]+$ && "$http_port" -gt 0 ]]; then
-                    printf "%s %s; #docker\n" "$domain" "$http_port" >> "$tmp_http"
+            # Write docker port entries.
+            # - Container running with real port  → write it
+            # - Container running, port 0, but last known port > 0 → keep last known (port remapping gap)
+            # - Container running, port 0, no prior port → write 0 → nginx extern_invalid=1 → 418 teapot
+            #   (prevents silent fallback to system PHP for a docker-managed domain)
+            # --clear-ports drops the entry entirely instead.
+            emit_port() {
+                local detected="$1" map_file="$2" old_port="$3"
+                if [[ "$detected" =~ ^[0-9]+$ && "$detected" -gt 0 ]]; then
+                    printf "%s %s; #docker\n" "$domain" "$detected" >> "$map_file"
+                elif [[ "$CLEAR_PORTS" == true ]]; then
+                    : # drop the entry
+                elif [[ -n "$old_port" && "$old_port" -gt 0 ]]; then
+                    echo -e "| ${CYAN}    Port not exposed for ${domain}${NC} — keeping last known port ${GREEN}${old_port}${NC}"
+                    printf "%s %s; #docker\n" "$domain" "$old_port" >> "$map_file"
+                else
+                    echo -e "| ${YELLOW_BOLD}[!] Port not exposed for ${domain}${NC} — writing 0 → nginx will return 418"
+                    printf "%s 0; #docker\n" "$domain" >> "$map_file"
                 fi
-                if [[ "$https_port" =~ ^[0-9]+$ && "$https_port" -gt 0 ]]; then
-                    printf "%s %s; #docker\n" "$domain" "$https_port" >> "$tmp_https"
-                fi
-            else
-                #
-                # CASE B: container does NOT exist anymore
-                #
-                if [[ "$KEEP_MISSING_PORTS" == true ]]; then
-                    # keep placeholder zero-ports
-                    printf "%s 0;\n" "$domain" >> "$tmp_http"
-                    printf "%s 0;\n" "$domain" >> "$tmp_https"
-                fi
-            fi
+            }
+            emit_port "$http_port"  "$tmp_http"  "${old_http_ports[$domain]:-}"
+            emit_port "$https_port" "$tmp_https" "${old_https_ports[$domain]:-}"
 
         done
 
@@ -1306,31 +1419,23 @@ update_ports_map() {
     done < <(getent passwd)
 
     # ======================================================
-    #  DIFF + conditional reload (NO reload if unchanged!)
+    #  Always write maps; only reload nginx when they changed
+    #  (cron-safe: runs every few minutes without churning nginx)
     # ======================================================
-    changed=0
+    local maps_changed=0
+    cmp -s "$tmp_http"  "$map_http"  || maps_changed=1
+    cmp -s "$tmp_https" "$map_https" || maps_changed=1
 
-    if ! cmp -s "$tmp_http" "$map_http"; then
-        mv "$tmp_http" "$map_http"
-        changed=1
-    else
-        rm -f "$tmp_http"
-    fi
-
-    if ! cmp -s "$tmp_https" "$map_https"; then
-        mv "$tmp_https" "$map_https"
-        changed=1
-    else
-        rm -f "$tmp_https"
-    fi
+    mv "$tmp_http"  "$map_http"
+    mv "$tmp_https" "$map_https"
 
     echo ""
-    if [[ $changed -eq 1 ]]; then
+    if [[ "$maps_changed" == 1 ]]; then
         echo -e "${GREEN}[✓] Maps updated.${NC}"
-        echo -e "${YELLOW_BOLD}Reloading nginx (changes detected)…${NC}"
+        echo -e "${YELLOW_BOLD}Reloading nginx…${NC}"
         systemctl reload nginx
     else
-        echo -e "${CYAN}[i] No changes detected - NGINX not reloaded.${NC}"
+        echo -e "${GREEN}[✓] Maps unchanged — skipping nginx reload.${NC}"
     fi
 }
 
@@ -1718,6 +1823,7 @@ list_vhosts() {
 
 lock_vhost() {
     local user="$1" domain="$2"
+    domain="${domain#https://}"; domain="${domain#http://}"; domain="${domain%/}"
     local lock
     lock=$(vhost_lock_path "$user" "$domain")
     [[ -d $(vhost_path "$user" "$domain") ]] || { echo -e "${RED}[!] No such vhost: $user/$domain${NC}"; exit 1; }
@@ -1728,6 +1834,7 @@ lock_vhost() {
 
 unlock_vhost() {
     local user="$1" domain="$2"
+    domain="${domain#https://}"; domain="${domain#http://}"; domain="${domain%/}"
     local lock
     lock=$(vhost_lock_path "$user" "$domain")
     if [[ -f "$lock" ]]; then
@@ -1762,10 +1869,350 @@ remove_vhost() {
     fi
 }
 
+list_certs_for_user() {
+    require_root
+    local target_user="$1"
+    [[ -z "$target_user" ]] && { echo -e "${RED}[!] Usage: nginx-pool certs <user>${NC}"; exit 1; }
+
+    local www_dir="/home/$target_user/www"
+    if [[ ! -d "$www_dir" ]]; then
+        echo -e "${RED}[!] No www directory found for user ${CYAN}$target_user${NC}"; return 1
+    fi
+
+    local user_domains=()
+    for _d in "$www_dir"/*/; do
+        [[ -d "$_d" ]] || continue
+        local fsname dom
+        fsname=$(basename "$_d"); dom=$(fs_domain "$fsname")
+        [[ "$dom" =~ \.lock$ ]] && continue
+        user_domains+=("$dom")
+    done
+
+    if [[ ${#user_domains[@]} -eq 0 ]]; then
+        echo -e "${YELLOW_BOLD}[i] No domains found for user ${CYAN}$target_user${NC}"; return 0
+    fi
+
+    echo -e "${BLUE_BOLD}[*] Domains for ${CYAN}$target_user${BLUE_BOLD}:${NC}"
+
+    declare -A domain_to_cert=()
+    declare -A cert_seen=()
+
+    for dom in "${user_domains[@]}"; do
+        local cert=""
+        [[ -f /etc/nginx/ssl_cert.map ]] && \
+            cert=$(awk -v d="$dom" '$1==d{gsub(/;/,"",$2); print $2; exit}' /etc/nginx/ssl_cert.map 2>/dev/null)
+        if [[ -z "$cert" && -d "/etc/letsencrypt/live/$dom" ]]; then cert="$dom"; fi
+        if [[ -z "$cert" ]]; then
+            local parts; IFS='.' read -ra parts <<< "$dom"
+            [[ ${#parts[@]} -ge 2 ]] && \
+                [[ -d "/etc/letsencrypt/live/${parts[-2]}.${parts[-1]}" ]] && cert="${parts[-2]}.${parts[-1]}"
+        fi
+        domain_to_cert["$dom"]="${cert:-}"
+        echo -e "  ${GREEN}$dom${NC} → cert: ${CYAN}${cert:-<none>}${NC}"
+        [[ -n "$cert" ]] && cert_seen["$cert"]=1
+    done
+
+    [[ ${#cert_seen[@]} -eq 0 ]] && { echo -e "\n${YELLOW_BOLD}[i] No certificates found.${NC}"; return 0; }
+
+    echo -e "\n${BLUE_BOLD}[*] Certificate details:${NC}\n"
+
+    for cert in "${!cert_seen[@]}"; do
+        echo -e "${CYAN}────────────────────────────────────────────────────────${NC}"
+        echo -e "${GREEN}Certificate:${NC} ${CYAN}$cert${NC}"
+        local sans=()
+        while IFS= read -r _s; do sans+=("$_s"); done < <(read_cert_sans "$cert") || true
+        if [[ ${#sans[@]} -gt 0 ]]; then
+            echo -e "${GRAY}Domains:${NC}"
+            for _s in "${sans[@]}"; do
+                if [[ -n "${domain_to_cert[$_s]+x}" ]]; then
+                    echo -e "  ${YELLOW_BOLD}• $_s${NC} ${GRAY}← $target_user${NC}"
+                else
+                    echo -e "  ${GRAY}• $_s${NC}"
+                fi
+            done
+        fi
+        local cert_pem="/etc/letsencrypt/live/$cert/cert.pem"
+        if [[ -f "$cert_pem" ]]; then
+            local expiry
+            expiry=$(openssl x509 -noout -enddate -in "$cert_pem" 2>/dev/null | sed 's/notAfter=//')
+            [[ -n "$expiry" ]] && echo -e "${GRAY}Expires:${NC} $expiry"
+        fi
+        echo
+    done
+}
+
+# ======================================================
+# REVERSE PROXY MANAGEMENT
+# ======================================================
+
+_rev_file() { echo "$REVERSE_DIR/$(fs_domain "$1")"; }
+_rev_get()  { grep "^${2}=" "$1" 2>/dev/null | head -1 | cut -d= -f2-; }
+
+_rev_cert_autodetect() {
+    local domain="$1"
+    [[ -d "/etc/letsencrypt/live/$domain" ]] && echo "$domain" && return
+    local parts; IFS='.' read -ra parts <<< "$domain"
+    if [[ ${#parts[@]} -ge 2 ]]; then
+        local base="${parts[-2]}.${parts[-1]}"
+        [[ -d "/etc/letsencrypt/live/$base" ]] && echo "$base" && return
+    fi
+    echo "${MASTER_DOMAINS[0]:-pool.glitchr.dev}"
+}
+
+reverse_add() {
+    require_root
+    local domain="$1" upstream="$2"
+    [[ -z "$domain" || -z "$upstream" ]] && {
+        echo -e "${RED}[!] Usage: nginx-pool reverse add <domain> <upstream> [--cert <c>] [--no-ssl-verify] [--index] [--no-ws] [--no-apply]${NC}"
+        exit 1
+    }
+    mkdir -p "$REVERSE_DIR"
+    local file; file=$(_rev_file "$domain")
+    local cert="${REVERSE_CERT:-}"
+    [[ -z "$cert" ]] && cert=$(_rev_cert_autodetect "$domain")
+
+    # Ask for consent if entry already exists
+    if [[ -f "$file" ]]; then
+        local old_upstream; old_upstream=$(_rev_get "$file" backend)
+        local old_cert;     old_cert=$(_rev_get "$file" cert)
+        echo -e "${YELLOW_BOLD}[!] Reverse proxy for ${CYAN}${domain}${YELLOW_BOLD} already exists:${NC}"
+        echo -e "    ${GRAY}Backend:  ${CYAN}${old_upstream}${NC}"
+        echo -e "    ${GRAY}Cert:     ${CYAN}${old_cert}${NC}"
+        confirm "Override existing entry?" || { echo -e "${GRAY}[i] Aborted.${NC}"; exit 0; }
+    fi
+
+    cat > "$file" <<EOF
+domain=${domain}
+backend=${upstream}
+cert=${cert}
+ssl_noverify=${REVERSE_NO_SSL_VERIFY}
+noindex=${REVERSE_NOINDEX}
+ws=${REVERSE_WS}
+EOF
+    echo -e "${GREEN}[✓] Reverse saved:${NC}"
+    echo -e "    ${GRAY}Domain:   ${CYAN}$domain${NC}"
+    echo -e "    ${GRAY}Backend:  ${CYAN}$upstream${NC}"
+    echo -e "    ${GRAY}Cert:     ${CYAN}$cert${NC}"
+    [[ "$REVERSE_NO_SSL_VERIFY" == "1" ]] && echo -e "    ${YELLOW_BOLD}⚠ SSL verify disabled (self-signed / internal upstream)${NC}"
+    [[ "$REVERSE_NOINDEX" == "1" ]]       && echo -e "    ${GRAY}noindex:  yes${NC}"
+    [[ "$REVERSE_WS" == "1" ]]            && echo -e "    ${GRAY}ws:       yes${NC}"
+    reverse_apply
+}
+
+reverse_remove() {
+    require_root
+    local domain="$1"
+    [[ -z "$domain" ]] && { echo -e "${RED}[!] Usage: nginx-pool reverse remove <domain>${NC}"; exit 1; }
+    local file; file=$(_rev_file "$domain")
+    if [[ -f "$file" ]]; then
+        rm -f "$file"
+        echo -e "${GREEN}[✓] Removed reverse for ${CYAN}$domain${NC}"
+        [[ "$REVERSE_NO_APPLY" != "true" ]] && reverse_apply
+    else
+        echo -e "${YELLOW_BOLD}[i] No reverse entry found for ${CYAN}$domain${NC}"
+    fi
+}
+
+reverse_show() {
+    local domain="$1"
+    [[ -z "$domain" ]] && { echo -e "${RED}[!] Usage: nginx-pool reverse show <domain>${NC}"; exit 1; }
+    local file; file=$(_rev_file "$domain")
+    if [[ ! -f "$file" ]]; then
+        echo -e "${RED}[!] No reverse entry for ${CYAN}$domain${NC}"; exit 1
+    fi
+    echo -e "${BLUE_BOLD}[*] Reverse: ${CYAN}$domain${NC}"
+    echo -e "------------------------------------------------------------"
+    while IFS='=' read -r k v; do
+        [[ -z "$k" || "$k" =~ ^# ]] && continue
+        printf "  ${GRAY}%-14s${NC} ${CYAN}%s${NC}\n" "$k" "$v"
+    done < "$file"
+    echo -e "------------------------------------------------------------"
+    local cert; cert=$(_rev_get "$file" "cert")
+    if [[ -d "/etc/letsencrypt/live/$cert" ]]; then
+        local expiry
+        expiry=$(openssl x509 -noout -enddate -in "/etc/letsencrypt/live/$cert/cert.pem" 2>/dev/null | sed 's/notAfter=//')
+        echo -e "  ${GRAY}cert status:${NC}   ${GREEN}✓ found${NC}${expiry:+  (expires: $expiry)}"
+    else
+        echo -e "  ${GRAY}cert status:${NC}   ${RED}✗ NOT found${NC} (/etc/letsencrypt/live/${cert})"
+    fi
+}
+
+reverse_list() {
+    local filter="${1:-}"
+    local count=0
+    local line; line=$(printf '─%.0s' {1..115})
+
+    echo -e "${BLUE_BOLD}[*] Reverse proxy entries${filter:+ — filter: ${CYAN}${filter}${BLUE_BOLD}}:${NC}"
+    printf "%-36s %-44s %-26s %s\n" "DOMAIN" "BACKEND" "CERT" "FLAGS"
+    echo "$line"
+
+    if [[ ! -d "$REVERSE_DIR" ]]; then
+        echo -e "${YELLOW_BOLD}[i] No reverses yet. Use: nginx-pool rev add <domain> <backend>${NC}"
+        return
+    fi
+
+    shopt -s nullglob
+    local files=("$REVERSE_DIR"/*)
+    shopt -u nullglob
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo -e "${YELLOW_BOLD}[i] No reverse entries found.${NC}"; return
+    fi
+
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        local domain upstream cert noverify noindex ws flags=""
+        domain=$(_rev_get "$f" "domain"); upstream=$(_rev_get "$f" "backend")
+        cert=$(_rev_get "$f" "cert");     noverify=$(_rev_get "$f" "ssl_noverify")
+        noindex=$(_rev_get "$f" "noindex"); ws=$(_rev_get "$f" "ws")
+        [[ -n "$filter" && "$domain" != *"$filter"* && "$cert" != *"$filter"* ]] && continue
+        [[ "$noverify" == "1" ]] && flags+="noverify "
+        [[ "$noindex"  == "1" ]] && flags+="noindex "
+        [[ "$ws"       == "1" ]] && flags+="ws"
+        local cert_mark="${RED}✗${NC}"
+        [[ -d "/etc/letsencrypt/live/$cert" ]] && cert_mark="${GREEN}✓${NC}"
+        printf "%-36s %-44s " "$domain" "$upstream"
+        printf "%-26s " "$cert"
+        echo -e "$cert_mark  ${flags% }"
+        count=$((count+1))
+    done
+
+    echo "$line"
+    echo -e "${GRAY}$count entr$([ "$count" -eq 1 ] && echo y || echo ies)${NC}"
+}
+
+_rev_block() {
+    local domain="$1" upstream="$2" cert="$3" noverify="$4" noindex="$5" ws="$6"
+    local logsafe="${domain//[^a-zA-Z0-9._-]/_}"
+    local pad; pad=$(printf '─%.0s' $(seq 1 $((70 - ${#domain} < 2 ? 2 : 70 - ${#domain}))))
+
+    local ssl_extra=""
+    [[ "$upstream" == https://* && "$noverify" == "1" ]] && \
+        ssl_extra=$'\n        proxy_ssl_verify       off;\n        proxy_ssl_server_name  on;'
+
+    local noindex_hdr=""
+    [[ "$noindex" == "1" ]] && \
+        noindex_hdr=$'\n    add_header X-Robots-Tag "noindex, noarchive, nosnippet" always;'
+
+    local ws_headers
+    if [[ "$ws" == "1" ]]; then
+        ws_headers=$'        proxy_set_header Upgrade    $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;'
+    else
+        ws_headers=$'        proxy_set_header Connection close;'
+    fi
+
+    cat <<NGINX
+# ── ${domain} ${pad}
+server {
+    listen 443 ssl;
+    http2  on;
+    server_name ${domain};
+    server_tokens off;
+
+    ssl_certificate     /etc/letsencrypt/live/${cert}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${cert}/privkey.pem;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options    "nosniff"    always;
+    add_header X-Frame-Options           "SAMEORIGIN" always;${noindex_hdr}
+
+    client_max_body_size 256M;
+    access_log /var/log/nginx/rev_${logsafe}.access.log;
+    error_log  /var/log/nginx/rev_${logsafe}.error.log;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+    }
+
+    location / {
+        proxy_pass ${upstream};${ssl_extra}
+
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Port  443;
+
+        proxy_http_version 1.1;
+${ws_headers}
+
+        proxy_connect_timeout  10s;
+        proxy_send_timeout     60s;
+        proxy_read_timeout    120s;
+    }
+}
+
+NGINX
+}
+
+reverse_apply() {
+    require_root
+    mkdir -p "$REVERSE_DIR"
+    echo -e "${BLUE_BOLD}[*] Rebuilding reverse proxy configuration...${NC}"
+
+    local tmp="${REVERSE_CONF_SRC}.tmp"
+    {
+        echo "# ======================================================================"
+        echo "# Auto-generated by: nginx-pool reverse apply"
+        echo "# Manage with:       nginx-pool reverse add / remove / list"
+        echo "# Source dir:        $REVERSE_DIR"
+        echo "# Generated:         $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "# ======================================================================"
+        echo
+    } > "$tmp"
+
+    local count=0 warn=0
+    shopt -s nullglob
+    local files=("$REVERSE_DIR"/*)
+    shopt -u nullglob
+
+    # Sort by domain name (= filename)
+    IFS=$'\n' read -r -d '' -a files < <(printf '%s\n' "${files[@]}" | sort; printf '\0') || true
+
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        local domain upstream cert noverify noindex ws
+        domain=$(_rev_get "$f" "domain"); upstream=$(_rev_get "$f" "backend")
+        cert=$(_rev_get "$f" "cert");     noverify=$(_rev_get "$f" "ssl_noverify")
+        noindex=$(_rev_get "$f" "noindex"); ws=$(_rev_get "$f" "ws")
+
+        if [[ -z "$domain" || -z "$upstream" || -z "$cert" ]]; then
+            echo -e "${YELLOW_BOLD}[!] Skipping malformed entry: $(basename "$f")${NC}"
+            warn=$((warn+1)); continue
+        fi
+        if [[ ! -d "/etc/letsencrypt/live/$cert" ]]; then
+            echo -e "${YELLOW_BOLD}[!] Cert '${cert}' not found for ${domain} — block will fail TLS${NC}"
+            warn=$((warn+1))
+        fi
+        _rev_block "$domain" "$upstream" "$cert" "$noverify" "$noindex" "$ws" >> "$tmp"
+        echo -e "  ${CYAN}→ ${GREEN}${domain}${NC} → ${CYAN}${upstream}${NC}"
+        count=$((count+1))
+    done
+
+    mv "$tmp" "$REVERSE_CONF_SRC"
+    cp "$REVERSE_CONF_SRC" "$REVERSE_CONF_DST"
+
+    echo
+    echo -e "${BLUE_BOLD}[*] ${count} block(s) generated${warn:+, ${YELLOW_BOLD}${warn} warning(s)${BLUE_BOLD}}.${NC}"
+    if nginx -t 2>&1 | grep -q "successful"; then
+        systemctl reload nginx
+        echo -e "${GREEN}[✓] nginx reloaded.${NC}"
+    else
+        echo -e "${RED}[✗] nginx config test FAILED:${NC}"
+        nginx -t 2>&1
+        echo -e "${YELLOW_BOLD}[i] Reverting to empty reverses.conf ...${NC}"
+        echo "# nginx-pool reverse apply failed — reverted" > "$REVERSE_CONF_DST"
+        systemctl reload nginx
+        exit 1
+    fi
+}
+
 # ---------- Main ----------
 cmd="${1:-}"
 u="${2:-}"
 d="${3:-}"
+e="${4:-}"
 
 case "$cmd" in
   add)      [[ -z "$u" || -z "$d" ]] && usage; add_vhost "$u" "$d" ;;
@@ -1782,11 +2229,27 @@ case "$cmd" in
   certs|list-certs|show-certs)
     if [[ "$u" == "--simple" ]]; then
       list_ssl_certs
+    elif [[ -n "$u" && "$u" != "--"* ]]; then
+      list_certs_for_user "$u"
     else
       show_certs
     fi
     ;;
   renew|cert-renew) cert_renew ;;
+  reverses) reverse_list "${u:-}" ;;
+  rev|reverse)
+    case "$u" in
+      add)         [[ -z "$d" ]] && { echo -e "${RED}[!] Usage: nginx-pool rev add <domain> <upstream>${NC}"; exit 1; }
+                   reverse_add "$d" "$e" ;;
+      remove|rm)   [[ -z "$d" ]] && { echo -e "${RED}[!] Usage: nginx-pool rev remove <domain>${NC}"; exit 1; }
+                   reverse_remove "$d" ;;
+      show)        [[ -z "$d" ]] && { echo -e "${RED}[!] Usage: nginx-pool rev show <domain>${NC}"; exit 1; }
+                   reverse_show "$d" ;;
+      list|"")     reverse_list "$d" ;;
+      apply)       reverse_apply ;;
+      *)           echo -e "${RED}[!] Unknown reverse subcommand: $u${NC}"; exit 1 ;;
+    esac
+    ;;
   users) users ;;
   symlinks) update_symlinks ;;
   domains) update_domains ;;
