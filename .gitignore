@@ -1,3 +1,5 @@
 .env
 *.conf
 *.map
+*.png
+reverses/

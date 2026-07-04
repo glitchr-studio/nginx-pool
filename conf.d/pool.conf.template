@@ -10,6 +10,19 @@ gzip_disable "msie6";
 gzip_vary on;
 
 # ------------------------------------------------------
+# Versioned asset caching
+# ------------------------------------------------------
+# Webpack Encore production builds emit content-hashed filenames
+# (e.g. app-async.1a2b3c4d.js). Those are immutable, so serve them with a
+# far-future cache. The dot-delimited hash segment is what distinguishes a
+# versioned file from an unversioned dev build (vendors-…-798fb5.js uses a
+# hyphen and is intentionally NOT matched). Empty value => add_header is a no-op.
+map $uri $asset_cache_control {
+    default                                                            "";
+    "~\.[0-9a-f]{6,}\.(?:js|css|woff2?|svg|png|webp|jpe?g|gif|ico)$"   "public, immutable, max-age=31536000";
+}
+
+# ------------------------------------------------------
 # SSL Certificate mapping
 # ------------------------------------------------------
 map $ssl_server_name $cert_name {
@@ -737,6 +750,10 @@ server {
 
         set $code 592;
         root $webroot;
+
+        # Far-future cache for content-hashed (versioned) assets only; the map
+        # yields an empty string for unversioned files, so add_header is a no-op.
+        add_header Cache-Control $asset_cache_control always;
 
         try_files $uri @php_fallback;
     }
