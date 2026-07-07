@@ -88,6 +88,9 @@ nginx-pool add alice blog.example.com --master example.com --extend-cert
 # Short-path app under pool.glitchr.dev
 nginx-pool add georges myapp --master pool.glitchr.dev
 # → https://georges.pool.glitchr.dev/myapp/
+
+# Force a standalone cert even though the domain matches *.$MASTER
+nginx-pool add alice blog.pool.glitchr.dev --dedicated
 ```
 
 ### Remove a vhost
@@ -171,8 +174,8 @@ nginx-pool reverse add <domain> <upstream> [options]
 | `--cert <name>` | auto-detected | cert family to use for TLS |
 | `--no-ssl-verify` | off | skip upstream TLS verification (self-signed certs) |
 | `--index` | off | allow search-engine indexing (default: `X-Robots-Tag: noindex`) |
-| `--no-ws` | on | disable WebSocket upgrade headers |
-| `--no-apply` | — | save entry but don't rebuild conf / reload nginx |
+| `--no-ws` | on | disable WebSocket upgrade headers (on by default) |
+| `--no-apply` | — | **no-op on `add`** (kept for backward compat — apply always runs); works as documented on `remove`, see below |
 
 **Examples:**
 
@@ -197,6 +200,7 @@ nginx-pool reverse add myapp.glitchr.dev   http://127.0.0.1:3000 --no-ws
 
 ```bash
 nginx-pool reverse remove carl.glitchr.dev
+nginx-pool reverse remove carl.glitchr.dev --no-apply   # delete the entry, skip rebuild/reload
 ```
 
 ### Show details
@@ -218,7 +222,8 @@ nginx-pool reverse list carl         # filter — matches domain or cert name
 nginx-pool reverse apply
 ```
 
-This is called automatically by `add` and `remove` unless `--no-apply` was passed.
+`reverse add` always calls this automatically (`--no-apply` is accepted but is a no-op there,
+kept only for backward compatibility). `reverse remove` still honors `--no-apply` and skips it.
 
 ### Entry file format (`.rev`)
 
@@ -238,11 +243,59 @@ Files live in `/var/www/nginx/reverses/` and are version-controlled with the res
 ## System utilities
 
 ```bash
-nginx-pool users      # rebuild user.map from /home/*/www/
-nginx-pool domains    # rebuild domain.map
-nginx-pool symlinks   # update symlinks in /var/www/pool
-nginx-pool ports      # rebuild port maps (Docker backends)
+nginx-pool users               # rebuild user.map from /home/*/www/
+nginx-pool domains             # rebuild domain.map
+nginx-pool symlinks            # update symlinks in /var/www/pool
+nginx-pool ports                # rebuild port maps (Docker backends)
+nginx-pool ports --clear-ports  # for a domain whose proxy container isn't running, drop its port
+                                 # entry instead of preserving the last-known mapping
+nginx-pool logs                # rebuild /etc/logrotate.d/pool-apps — see "Log rotation" below
 ```
+
+---
+
+## Log rotation
+
+```bash
+nginx-pool logs      # rebuild /etc/logrotate.d/pool-apps from current pool state
+```
+
+App logs under every vhost — `<domain>/var/log/*.log`, one level nested
+(`<domain>/<subdir>/var/log/*.log`), and app-native `<domain>/<subdir>/logs/*.log`
+(e.g. Roundcube) — are rotated daily via `/etc/logrotate.d/pool-apps`, executed by
+the system's existing `logrotate.timer` (no separate cron entry needed to *run* it).
+
+The file is one stanza **per (owner, group) actually observed** on each log
+directory, not one stanza per pool user. Two things force this:
+
+1. logrotate refuses to touch files under a group-writable directory — the pool's
+   own ACL model (owner user + `www-data` group both writable) — unless told which
+   user/group to run the rotation as, via `su`.
+2. Ownership isn't uniform per pool user: a Docker-managed vhost is commonly owned
+   by `www-data` or even `root` (the container's own internal process owns the
+   bind-mounted files) even though it lives under, say, `/home/apfelschorlette/www/`.
+   A single `su <pool-user>` value is wrong for those paths and gets rejected.
+
+Nested log dirs are discovered with `find -type d` rather than a `*` glob. Some
+vhosts alias a subdirectory via a symlink (e.g. `dev.glitchr.mail/current ->
+1.6.0`); a glob follows that symlink as a second, identical match in the same
+run, which double-rotates the same physical file and clobbers the just-rotated
+backup with an empty one — `find` (no `-L`) reports symlinks as type `l`, never
+`d`, so only the real directory is ever matched. The same exclusion drops
+dotfile/dot-dir components (`.git`, frozen `.bak` snapshots, ...).
+
+Because the config is a snapshot of current pool state (not live globs alone),
+`nginx-pool logs` must be re-run whenever pool membership or ownership changes —
+it's called automatically by `add`, and also runs daily from cron (see below) to
+pick up vhosts added directly on disk.
+
+```bash
+logrotate -d /etc/logrotate.d/pool-apps   # dry-run, shows what would rotate
+logrotate -f /etc/logrotate.d/pool-apps   # force rotation now (e.g. right after 'nginx-pool logs')
+```
+
+Nginx's own `access.log`/`error.log` (including per-reverse-proxy logs) are rotated
+separately by the distro's `/etc/logrotate.d/nginx` (daily, 52 rotations, compressed).
 
 ---
 
@@ -260,6 +313,9 @@ nginx-pool lock alice blog.example.com
 
 # 4. Renew all certs (add to cron)
 0 3 * * 1  /usr/local/bin/nginx-pool renew >> /var/log/nginx-pool-renew.log 2>&1
+
+# 5. Keep pool-apps.conf in sync with pool membership (add to cron)
+15 0 * * * /usr/local/bin/nginx-pool logs 2>&1 | /usr/bin/logger -t nginx-pool-logs
 ```
 
 ---

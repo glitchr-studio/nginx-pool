@@ -43,6 +43,7 @@ install: config
 	@cp conf.d/*.conf /etc/nginx/conf.d/
 	@touch /etc/nginx/user.map /etc/nginx/legacy.map /etc/nginx/domain.map /etc/nginx/lock.map /etc/nginx/ssl_cert.map
 	@touch /etc/nginx/port_http.map /etc/nginx/port_https.map
+	@/usr/local/bin/nginx-pool logs
 	@$(MAKE) reload
 
 reload:
