@@ -3,7 +3,7 @@
 # nginx-pool : Manage users and virtual hosts for ${MASTER}|localhost
 # ----------------------------------------------------------
 # Usage:
-#   nginx-pool add <user> <domain> [--master <cert>] [--extend-cert]
+#   nginx-pool add <user> <domain> [--master <cert>] [--extend-cert] [--dedicated]
 #   nginx-pool cert <domain> [--master <cert_family>]
 #   nginx-pool list [--local] [--backend]
 #   nginx-pool certs [<user>]
@@ -18,6 +18,8 @@
 #   nginx-pool users
 #   nginx-pool domains
 #   nginx-pool symlinks
+#   nginx-pool logs
+#   nginx-pool ports [--clear-ports]
 #
 # Notes:
 # - Each virtual host maps to:
@@ -164,7 +166,7 @@ usage() {
     local me; me=$(basename "$0")
     echo -e "${YELLOW_BOLD}Usage:${NC}"
     echo -e "  ${GREEN}Domain Management:${NC}"
-    echo -e "    $me add <user> <domain> [--master <cert>] [--extend-cert]"
+    echo -e "    $me add <user> <domain> [--master <cert>] [--extend-cert] [--dedicated]"
     echo -e "    $me remove <user> [domain]"
     echo -e "    $me lock <user> <domain>"
     echo -e "    $me unlock <user> <domain>"
@@ -182,7 +184,8 @@ usage() {
     echo -e "        --cert <name>       override cert (auto-detected otherwise)"
     echo -e "        --no-ssl-verify     skip TLS verification to backend (self-signed)"
     echo -e "        --index             allow indexing (default: noindex)"
-    echo -e "        --ws                enable WebSocket upgrade headers (default: off)"
+    echo -e "        --no-ws             disable WebSocket upgrade headers (default: on)"
+    echo -e "        --no-apply          ${GRAY}(add: no-op, kept for compat — apply always runs; remove: skips it)${NC}"
     echo -e "    $me rev show <domain>                                 # Show entry details"
     echo -e "    $me rev remove <domain>                               # Remove a reverse proxy"
     echo -e "    $me rev apply                                         # Rebuild reverses.conf + reload nginx"
@@ -191,6 +194,7 @@ usage() {
     echo -e "    $me users                                    # Rebuild user.map"
     echo -e "    $me domains                                  # Rebuild domain.map"
     echo -e "    $me symlinks                                 # Update symlinks in /var/www/pool"
+    echo -e "    $me logs                                     # Rebuild /etc/logrotate.d/pool-apps"
     echo -e "    $me ports [--clear-ports]                    # Rebuild port maps for Docker backends"
     echo -e "    $me acl <user> [domain]                      # Fix ACL permissions"
     echo
@@ -211,15 +215,18 @@ usage() {
     echo -e "  $me reverses carl                              ${GRAY}# filter by 'carl'${NC}"
     echo -e "  $me rev add carl.glitchr.dev https://192.168.92.3 --no-ssl-verify --cert carl.glitchr.dev"
     echo -e "  $me rev add nas.glitchr.dev  https://192.168.92.3:5001 --no-ssl-verify"
-    echo -e "  $me rev add chat.glitchr.dev http://127.0.0.1:3000 --ws"
+    echo -e "  $me rev add chat.glitchr.dev http://127.0.0.1:3000        ${GRAY}# ws is on by default${NC}"
+    echo -e "  $me rev add legacy.glitchr.dev http://127.0.0.1:8080 --no-ws"
     echo -e "  $me rev apply                                  ${GRAY}# rebuild conf + reload nginx${NC}"
     echo
     echo -e "${BLUE_BOLD}Notes:${NC}"
     echo -e "  ${GRAY}• Use 'cert' for existing domains, 'add' for new ones${NC}"
     echo -e "  ${GRAY}• --extend-cert is opt-in; preserves all existing SANs before adding new domain${NC}"
     echo -e "  ${GRAY}• --master groups domains under one certificate family${NC}"
+    echo -e "  ${GRAY}• --dedicated forces a standalone cert even for a *.\$MASTER subdomain${NC}"
     echo -e "  ${GRAY}• reverse entries are stored in $REVERSE_DIR/ (reversed domain names, no extension)${NC}"
     echo -e "  ${GRAY}• reverse apply writes $REVERSE_CONF_DST and reloads nginx${NC}"
+    echo -e "  ${GRAY}• app logs (var/log, logs) under every vhost are rotated via /etc/logrotate.d/pool-apps (rebuilt by 'logs')${NC}"
     echo
     exit 1
 }
@@ -1186,6 +1193,7 @@ add_vhost() {
     fix_acl "$user" "$domain" > /dev/null
     users > /dev/null
     update_symlinks > /dev/null
+    update_logrotate > /dev/null
 
     echo
     echo -e "${BLUE_BOLD}[*] Next Steps:${NC}"
@@ -1666,6 +1674,114 @@ update_symlinks() {
     echo
     echo -e "${GREEN}[✓] Symlink update complete.${NC}"
     echo -e "    ${CYAN}$total${NC} active symlinks."
+}
+
+update_logrotate() {
+
+    require_root
+
+    local conf_file="/etc/logrotate.d/pool-apps"
+    local tmp_file="${conf_file}.tmp"
+
+    echo -e "${BLUE_BOLD}[*] Rebuilding pool app-log rotation...${NC}"
+
+    # Bucket patterns by the ACTUAL owner:group of their parent directory,
+    # not by pool username. Docker-managed vhosts are frequently owned by
+    # www-data or even root although they live under a pool user's home
+    # (the container's own internal process owns the bind-mounted files,
+    # not the host account) — a single per-pool-user 'su' value is wrong
+    # for those and logrotate refuses to touch them ("insecure permissions").
+    declare -A bucket=()
+
+    add_pattern() {
+        local dir="$1"
+        [[ -d "$dir" ]] || return 0
+        local owner group
+        owner=$(stat -c '%U' "$dir") || return 0
+        group=$(stat -c '%G' "$dir") || return 0
+        bucket["$owner:$group"]+="$dir/*.log"$'\n'
+    }
+
+    while IFS=: read -r name _; do
+        if id -nG "$name" 2>/dev/null | grep -qw www-data; then
+
+            local root="/home/$name/www"
+            [[ -d "$root" ]] || continue
+
+            # Convention: <domain>/var/log/*.log — domain dirs are never symlinks
+            # (only /var/www/pool/* mirrors them, not /home/*/www/* itself).
+            for d in "$root"/*; do
+                [[ -d "$d" ]] || continue
+                add_pattern "$d/var/log"
+            done
+
+            # One level nested: <domain>/<subdir>/{var/log,logs}/*.log — real
+            # subdirectories only. Some vhosts alias a subdirectory via a
+            # symlink (e.g. dev.glitchr.mail/current -> 1.6.0); a '*' glob
+            # follows it as a second, identical match in the same run, which
+            # double-rotates the same physical file and clobbers the
+            # just-rotated backup with an empty one. 'find' (no -L) reports
+            # symlinks as type 'l', never 'd', so only the real directory is
+            # ever matched. '! -name .*' skips dirs like .git the same way
+            # the domain-level glob above skips dotfiles/.bak snapshots.
+            while IFS= read -r sub; do
+                add_pattern "$sub/var/log"
+                add_pattern "$sub/logs"
+            done < <(find "$root" -mindepth 2 -maxdepth 2 -type d ! -name '.*' 2>/dev/null)
+        fi
+    done < <(getent passwd)
+
+    {
+        echo "# Auto-generated by nginx-pool logs — do not edit manually"
+        echo "#"
+        echo "# One stanza per (owner, group) actually observed on a log directory"
+        echo "# under /home/<pool-user>/www/*, covering the conventions in use:"
+        echo "#   - Symfony-style:      <domain>/var/log/*.log"
+        echo "#   - one level nested:   <domain>/<subdir>/var/log/*.log"
+        echo "#   - app-native \"logs\":   <domain>/<subdir>/logs/*.log"
+        echo "#"
+        echo "# Grouped by real ownership rather than by pool username: logrotate"
+        echo "# needs an explicit 'su' to touch files under a group-writable"
+        echo "# directory (the pool's own ACL model), and ownership isn't uniform"
+        echo "# per pool user — Docker-managed vhosts are commonly owned by"
+        echo "# www-data or root even though they live under a pool user's home."
+    } > "$tmp_file"
+
+    local total=0
+
+    for key in $(printf '%s\n' "${!bucket[@]}" | sort); do
+        local owner="${key%%:*}" group="${key##*:}"
+
+        {
+            echo
+            printf '%s' "${bucket[$key]}" | sort
+            echo "{"
+            echo "    daily"
+            echo "    missingok"
+            echo "    rotate 14"
+            echo "    compress"
+            echo "    delaycompress"
+            echo "    notifempty"
+            echo "    maxsize 100M"
+            echo "    su $owner $group"
+            echo "    create"
+            echo "    sharedscripts"
+            echo "}"
+        } >> "$tmp_file"
+
+        total=$((total + 1))
+    done
+
+    if ! cmp -s "$tmp_file" "$conf_file"; then
+        mv "$tmp_file" "$conf_file"
+        chown root:root "$conf_file"
+        chmod 644 "$conf_file"
+
+        echo -e "${GREEN}[✓] Updated: ${CYAN}$conf_file${NC} (${total} ownership groups)."
+    else
+        rm -f "$tmp_file"
+        echo -e "${CYAN}[i] No changes detected - ${conf_file} unchanged.${NC}"
+    fi
 }
 
 update_domains() {
@@ -2252,6 +2368,7 @@ case "$cmd" in
     ;;
   users) users ;;
   symlinks) update_symlinks ;;
+  logs) update_logrotate ;;
   domains) update_domains ;;
   ports) update_ports_map ;;
   help|--help|-h) usage ;;
