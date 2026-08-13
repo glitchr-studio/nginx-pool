@@ -1,0 +1,4 @@
+#!/bin/sh
+# nginx-pool-mcp - stdio MCP server exposing a real browser over the pool.
+# Registered in an MCP client as: command="nginx-pool-mcp"
+exec python3 "$(dirname "$(readlink -f "$0")")/../mcp/browser/server.py" "$@"

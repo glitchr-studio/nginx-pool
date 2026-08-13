@@ -254,6 +254,26 @@ nginx-pool logs                # rebuild /etc/logrotate.d/pool-apps — see "Log
 
 ---
 
+## NGINX-BrowserMCP (browser automation)
+
+`bin/nginx-pool-mcp` is a stdio [MCP](https://modelcontextprotocol.io) server that
+drives a real headless Chromium over CDP — so a tool-using assistant can *look at*
+a page (render it, hover, click, switch to a phone viewport) instead of guessing
+from CSS text. It targets any URL, and `pool_sites` enumerates the hosts this pool
+serves straight from `domain.map` / `user.map`.
+
+```bash
+./bin/nginx-pool-mcp          # stdio server, nothing to configure
+```
+
+```json
+{ "mcpServers": { "NGINX-BrowserMCP": { "command": "/var/www/nginx/bin/nginx-pool-mcp" } } }
+```
+
+Full tool reference in [`mcp/browser/README.md`](mcp/browser/README.md).
+
+---
+
 ## Log rotation
 
 ```bash
