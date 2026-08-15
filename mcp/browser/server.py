@@ -168,11 +168,21 @@ class Tab:
                                + " " + str(r["exceptionDetails"].get("exception", {}).get("description", ""))[:300])
         return r.get("result", {}).get("value")
 
-    def rect(self, selector):
+    def rect(self, selector, scroll=True):
+        """Viewport-relative box, plus the page-absolute one.
+
+        Both are needed and they are NOT interchangeable: Input.dispatchMouseEvent
+        takes viewport coordinates, while Page.captureScreenshot's clip is
+        page-absolute whenever captureBeyondViewport is set. Passing the viewport
+        box as a clip silently photographs the wrong region of any scrolled page.
+        """
         v = self.js("""(function(){var e=document.querySelector(%s);
-            if(!e) return null; e.scrollIntoView({block:'center',inline:'center'});
+            if(!e) return null; %s
             var r=e.getBoundingClientRect();
-            return {x:r.left,y:r.top,w:r.width,h:r.height};})()""" % json.dumps(selector))
+            return {x:r.left,y:r.top,w:r.width,h:r.height,
+                    px:r.left+window.scrollX,py:r.top+window.scrollY};})()"""
+            % (json.dumps(selector),
+               "e.scrollIntoView({block:'center',inline:'center'});" if scroll else ""))
         if not v:
             raise LookupError("no element matches %r" % selector)
         return v
@@ -368,7 +378,7 @@ def t_browser_screenshot(selector=None, full=False, scale=2, pad=16):
     t = tab()
     if selector:
         r = t.rect(selector)
-        clip = {"x": r["x"] - pad, "y": r["y"] - pad,
+        clip = {"x": r["px"] - pad, "y": r["py"] - pad,
                 "width": r["w"] + 2 * pad, "height": r["h"] + 2 * pad}
         cap = "%s at %dx%d" % (selector, round(r["w"]), round(r["h"]))
     elif full:
@@ -378,7 +388,7 @@ def t_browser_screenshot(selector=None, full=False, scale=2, pad=16):
         cap = "full page %dx%d" % (c["width"], c["height"])
         scale = min(scale, 1)
     else:
-        clip, cap = None, "viewport"
+        clip, cap = None, "viewport"  # no clip: viewport capture needs no mapping
     return _img(t.shot(clip, scale), "%s - %s" % (cap, STATE.get("device") or "default"))
 
 
@@ -386,7 +396,7 @@ def t_browser_states(selector, pad=18, scale=3):
     """rest / hover / active, driven with real mouse input."""
     t = tab()
     r = t.rect(selector)
-    clip = {"x": r["x"] - pad, "y": r["y"] - pad,
+    clip = {"x": r["px"] - pad, "y": r["py"] - pad,
             "width": r["w"] + 2 * pad, "height": r["h"] + 2 * pad}
     out, report = [], {}
     t.mouse("mouseMoved", 2, 2); time.sleep(.35)
