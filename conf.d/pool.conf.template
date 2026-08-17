@@ -658,6 +658,15 @@ server {
         proxy_set_header X-Forwarded-Port  443;
         proxy_set_header Host $host;
 
+        # nginx only inherits proxy_set_header directives from the parent
+        # context when the current context defines none of its own - since
+        # this location already sets the four headers above, the server
+        # block's Upgrade/Connection headers (needed for WebSocket proxying)
+        # are silently dropped unless redeclared here too.
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
         # Prevent backend loops
         proxy_redirect off;
 
@@ -720,6 +729,12 @@ server {
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Ssl   on;
         proxy_set_header X-Forwarded-Port  443;
+
+        # Same all-or-nothing proxy_set_header inheritance gotcha as
+        # @port_fallback above - this location already redeclares its own
+        # headers, so Upgrade/Connection need to be explicit here too.
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
 
         proxy_redirect off;
 
