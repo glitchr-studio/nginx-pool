@@ -87,8 +87,18 @@ class Tab:
         r = requests.put(CDP_HOST + "/json/new?about:blank", timeout=15)
         self.meta = r.json()
         self.id = self.meta["id"]
+        # suppress_origin=True, NOT origin="".
+        #
+        # Chrome's DevTools endpoint refuses any websocket upgrade that carries
+        # a disallowed Origin header (its DNS-rebinding defence). websocket-client
+        # treats origin="" as "send an empty Origin", so the header was still
+        # present and every connection came back 403 Forbidden - while plain HTTP
+        # to /json kept working, which makes it look like the browser is fine and
+        # only the MCP layer is broken. suppress_origin omits the header entirely,
+        # which is what the endpoint wants. Newer Chrome tightened this check, so
+        # the same code passed on older builds.
         self.ws = websocket.create_connection(self.meta["webSocketDebuggerUrl"],
-                                              timeout=60, origin="")
+                                              timeout=60, suppress_origin=True)
         self._i = 0
         self.console = []
         self.failures = []
