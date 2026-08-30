@@ -82,11 +82,45 @@ DEVICES = {
 }
 
 
+# Ids of tabs THIS process created. The browser profile is shared by every MCP
+# server running against it, so a reaper must never close a tab it did not open -
+# a blank tab that looks abandoned may be another session's, a moment before it
+# navigates.
+_OWNED = set()
+
+
+def reap_owned(keep=None):
+    """Close tabs we created and lost track of. Ours only, never anyone else's."""
+    for tab_id in list(_OWNED):
+        if tab_id == keep:
+            continue
+        try:
+            requests.get("%s/json/close/%s" % (CDP_HOST, tab_id), timeout=5)
+        except Exception:
+            pass
+        _OWNED.discard(tab_id)
+
+
 class Tab:
     def __init__(self, width=1440, height=900):
         r = requests.put(CDP_HOST + "/json/new?about:blank", timeout=15)
         self.meta = r.json()
         self.id = self.meta["id"]
+        self.ws = None
+        # The tab EXISTS in the browser from here on, so everything below has to
+        # be unwound on failure. It was not: when the websocket handshake started
+        # returning 403 (see the note below), every browser_open left behind an
+        # about:blank page nobody held a reference to, each pinning a renderer
+        # process for the life of the browser. Eleven of them had accumulated in
+        # the shared profile, ~300MB, on a host already deep in swap.
+        _OWNED.add(self.id)
+        try:
+            self._connect(width, height)
+        except Exception:
+            self.close()
+            raise
+
+    def _connect(self, width, height):
         # suppress_origin=True, NOT origin="".
         #
         # Chrome's DevTools endpoint refuses any websocket upgrade that carries
@@ -229,6 +263,7 @@ class Tab:
             requests.get("%s/json/close/%s" % (CDP_HOST, self.id), timeout=10)
         except Exception:
             pass
+        _OWNED.discard(self.id)
 
 
 # --------------------------------------------------------------------------
@@ -349,6 +384,9 @@ def t_browser_open(url, device=None, basic_auth=None, cookies_file=None, wait=3.
     if TAB is not None:
         TAB.close()
     TAB = Tab()
+    # Anything of ours still open from an earlier failure - or from a previous
+    # run of this process - goes now that we hold a good tab again.
+    reap_owned(keep=TAB.id)
     if basic_auth:
         user, _, pwd = basic_auth.partition(":")
         tok = base64.b64encode(("%s:%s" % (user, pwd)).encode()).decode()
