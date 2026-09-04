@@ -409,7 +409,18 @@ map $php_script_override $php_script {
 # Static file detection
 # ------------------------------------------------------
 map $uri $is_static {
-    "~*\.(css|js|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm|ogg|json|txt|xml)$" 1;
+    # html? is in the list because a request for an existing .html file must be
+    # served as a FILE. Without it $is_static was 0, the request fell through to
+    # `if (-f $webroot$php_script) { return 593; }` and the app's front controller
+    # answered instead - Roundcube's skins/elastic/watermark.html came back as a
+    # 5382-byte index.php page rather than the 853-byte file on disk. That page
+    # carries RELATIVE asset paths ("skins/elastic/ui.min.js"), which the browser
+    # then resolved against /skins/elastic/, giving /skins/elastic/skins/elastic/...
+    # Those 404-ish paths hit the front controller too, so every asset arrived as
+    # text/html and X-Content-Type-Options: nosniff refused to execute them.
+    # @asset_resolver still does `try_files $uri @php_fallback`, so a .html path
+    # with no file behind it keeps falling through to PHP exactly as before.
+    "~*\.(css|js|map|html?|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm|ogg|json|txt|xml)$" 1;
     "~*\.php$"      0;
     default         0;
 }
