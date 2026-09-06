@@ -421,6 +421,17 @@ map $uri $is_static {
     # @asset_resolver still does `try_files $uri @php_fallback`, so a .html path
     # with no file behind it keeps falling through to PHP exactly as before.
     "~*\.(css|js|map|html?|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm|ogg|json|txt|xml)$" 1;
+
+    # Downloadable binaries: disk images, installers, archives, documents and the
+    # media types the list above misses. Without them a request for e.g.
+    # /share/<token>/app.dmg is NOT flagged static, so it skips @asset_resolver
+    # entirely and only reaches the file by accident, through @html_fallback's
+    # `try_files $uri` - which means it 404s outright on any pool site whose root
+    # carries no index.html. @asset_resolver still ends in `try_files $uri
+    # @php_fallback`, so an app-generated URL ending in one of these extensions
+    # with no file behind it keeps falling through to the front controller
+    # exactly as before.
+    "~*\.(dmg|pkg|iso|img|exe|msi|apk|deb|rpm|zip|7z|rar|tar|gz|tgz|bz2|tbz|xz|txz|zst|pdf|epub|mp3|m4a|wav|flac|aac|mov|m4v|avi|mkv|avif|otf)$" 1;
     "~*\.php$"      0;
     default         0;
 }
@@ -816,7 +827,12 @@ server {
         set $code 594;
         root $webroot;
 
-        try_files $uri /index.html @nginx_default;
+        # $uri/index.html must be tried BEFORE the site-root /index.html. Without
+        # it a directory URL such as /share/<token>/ never matches `try_files
+        # $uri` (that tests a file, and a trailing-slash path is a directory), so
+        # it fell straight through to the root index.html - every subdirectory of
+        # a static pool site answered with the HOME page instead of its own.
+        try_files $uri $uri/index.html /index.html @nginx_default;
     }
 
     # ======================================================
