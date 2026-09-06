@@ -3,3 +3,4 @@
 *.map
 *.png
 reverses/
+__pycache__/
