@@ -37,7 +37,7 @@ php:
 	             php8.3-bcmath php8.3-zip php8.3-sqlite3 php8.3-gd php8.3-opcache php3-igbinary php8.3-cli php8.3-igbinary
 	@update-alternatives --config php
 
-install: config
+install: config automation
 	@cp bin/* /usr/local/bin/
 	@cp nginx.conf /etc/nginx/
 	@cp conf.d/*.conf /etc/nginx/conf.d/
@@ -45,6 +45,22 @@ install: config
 	@touch /etc/nginx/port_http.map /etc/nginx/port_https.map
 	@/usr/local/bin/nginx-pool logs
 	@$(MAKE) reload
+
+# Restart policy for the daemon + the pool's scheduled jobs.
+# The cron entries used to live in root's personal crontab; if they are still
+# there they would run twice, so this refuses to install until they are gone.
+automation:
+	@if crontab -l 2>/dev/null | grep -q "nginx-pool"; then \
+		echo "[!] root's crontab still has nginx-pool entries."; \
+		echo "    Remove them first (crontab -e), they are superseded by /etc/cron.d/nginx-pool:"; \
+		crontab -l 2>/dev/null | grep "nginx-pool" | sed 's/^/      /'; \
+		exit 1; \
+	fi
+	@install -d /etc/systemd/system/nginx.service.d
+	@install -m 644 systemd/override.conf /etc/systemd/system/nginx.service.d/override.conf
+	@install -m 644 cron/nginx-pool /etc/cron.d/nginx-pool
+	@systemctl daemon-reload
+	@echo "[ok] restart policy + /etc/cron.d/nginx-pool installed"
 
 reload:
 	@nginx -t
