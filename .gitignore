@@ -4,3 +4,4 @@
 *.png
 reverses/
 __pycache__/
+!systemd/*.conf

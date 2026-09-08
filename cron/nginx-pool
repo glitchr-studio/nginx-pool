@@ -1,0 +1,21 @@
+# /etc/cron.d/nginx-pool — installed by nginx-pool: `make automation`.
+# Replaces the equivalent entries in root's personal crontab, so that the
+# pool's scheduling lives in the repository and can be reviewed.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Bring nginx back if its unit has failed. Silent while nginx is healthy, and
+# deliberately ignores a merely stopped unit so maintenance is not fought.
+*/2 * * * * root /usr/local/bin/nginx-pool watchdog 2>&1 | /usr/bin/logger -t nginx-pool-watchdog
+
+# Rebuild port_http.map / port_https.map from the running containers.
+# No flock here on purpose: `ports` takes /run/lock/nginx-pool-ports.lock
+# itself, which also covers manual runs. Wrapping it again from cron would
+# make every run fail to acquire its own lock.
+*/5 * * * * root /usr/local/bin/nginx-pool ports 2>&1 | /usr/bin/logger -t nginx-pool-ports
+
+# Renew certificates.
+0 * * * * root flock -n /run/lock/nginx-pool-renew.lock /usr/local/bin/nginx-pool renew 2>&1 | /usr/bin/logger -t nginx-pool-renew
+
+# Rotate the per-vhost app logs.
+15 0 * * * root flock -n /run/lock/nginx-pool-logs.lock /usr/local/bin/nginx-pool logs 2>&1 | /usr/bin/logger -t nginx-pool-logs
