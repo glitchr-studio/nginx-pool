@@ -177,6 +177,7 @@ usage() {
     echo -e "    $me certs [<user>]                                    # View certs (all, or scoped to user)"
     echo -e "    $me renew                                             # Renew all certs (cron-safe)"
     echo -e "    $me ssl-map                                           # Rebuild ssl_cert.map"
+    echo -e "    $me watchdog                                          # Restart nginx if its unit has failed (cron)"
     echo
     echo -e "  ${GREEN}Reverse Proxy Management:${NC} ${GRAY}('rev' is a shorthand for 'reverse')${NC}"
     echo -e "    $me reverses [<filter>]                               # List all reverse proxies (quick shortcut)"
@@ -229,6 +230,47 @@ usage() {
     echo -e "  ${GRAY}• app logs (var/log, logs) under every vhost are rotated via /etc/logrotate.d/pool-apps (rebuilt by 'logs')${NC}"
     echo
     exit 1
+}
+
+# Reload nginx — but start it instead when the daemon is down.
+# systemd's ExecReload is a bare "kill -HUP" on a forking unit, so it exits 0
+# whether or not the master accepted the new config, and it does nothing at all
+# when the unit is dead. Callers here have already validated the config, so the
+# daemon being down is a state to repair, not a reason to give up silently.
+nginx_reload_or_start() {
+    if systemctl is-active --quiet nginx; then
+        echo -e "${YELLOW_BOLD}Reloading nginx…${NC}"
+        systemctl reload nginx
+        return 0
+    fi
+
+    echo -e "${YELLOW_BOLD}[!] nginx is not running — starting it…${NC}"
+    if ! nginx -t >/dev/null 2>&1; then
+        echo -e "${RED}[✗] Refusing to start: the config does not pass nginx -t:${NC}"
+        nginx -t 2>&1 | sed 's/^/      /' || true
+        return 1
+    fi
+    systemctl start nginx
+}
+
+# Cron entry point: bring nginx back only when the unit has actually FAILED.
+# A plain "systemctl stop" leaves the unit inactive, which is a deliberate
+# maintenance state and must not be fought. Silent when nginx is healthy, so
+# it can run every couple of minutes without filling syslog.
+nginx_watchdog() {
+    require_root
+
+    local state
+    state=$(systemctl is-failed nginx 2>/dev/null || true)
+    [[ "$state" == "failed" ]] || return 0
+
+    echo -e "${YELLOW_BOLD}[!] nginx unit is in 'failed' state — attempting recovery…${NC}"
+    if nginx_reload_or_start; then
+        echo -e "${GREEN}[✓] nginx recovered by watchdog.${NC}"
+    else
+        echo -e "${RED}[✗] Watchdog could not recover nginx — manual action required.${NC}"
+        return 1
+    fi
 }
 
 fs_domain() {
@@ -450,7 +492,7 @@ update_ssl_map() {
         if nginx -t 2>&1 | grep -q "successful"; then
             echo -e "${GREEN}[✓] NGINX configuration valid.${NC}"
             echo -e "${YELLOW_BOLD}Reloading nginx...${NC}"
-            systemctl reload nginx
+            nginx_reload_or_start
             echo -e "${GREEN}[✓] NGINX reloaded.${NC}"
         else
             echo -e "${RED}[✗] NGINX configuration test failed!${NC}"
@@ -681,7 +723,7 @@ create_ssl_cert() {
     # Reload nginx
     echo -e "${YELLOW_BOLD}[*] Reloading nginx...${NC}"
     if nginx -t 2>&1 | grep -q "successful"; then
-        systemctl reload nginx
+        nginx_reload_or_start
         echo -e "${GREEN}[✓] NGINX reloaded.${NC}"
     else
         echo -e "${RED}[✗] NGINX configuration test failed!${NC}"
@@ -959,7 +1001,7 @@ extend_cert() {
     fi
 
     echo -e "${GREEN}[✓] Certificate ${CYAN}$cert_name${GREEN} extended successfully.${NC}"
-    systemctl reload nginx
+    nginx_reload_or_start
 }
 
 show_certs() {
@@ -1070,7 +1112,7 @@ cert_renew() {
     # Reload NGINX
     echo
     echo -e "${BLUE_BOLD}[*] Reloading NGINX...${NC}"
-    systemctl reload nginx
+    nginx_reload_or_start
 
     if [[ $? -eq 0 ]]; then
         echo -e "${GREEN}[✓] NGINX reloaded successfully${NC}"
@@ -1246,8 +1288,26 @@ update_ports_map() {
     local map_http="/etc/nginx/port_http.map"
     local map_https="/etc/nginx/port_https.map"
 
-    local tmp_http="${map_http}.tmp"
-    local tmp_https="${map_https}.tmp"
+    # ======================================================
+    #  Serialize runs.
+    #  Cron fires 'ports' every 5 min, but a loaded box can stretch a single
+    #  run to several minutes (docker ps / docker port block). Two overlapping
+    #  runs used to share one fixed .tmp buffer and emit the same domain twice;
+    #  nginx rejects that as "conflicting parameter" — silently, because a
+    #  reload keeps the previous config, so the pool only dies at the next
+    #  start. Skipping a run is harmless: the next one is 5 minutes away.
+    # ======================================================
+    exec 9>"/run/lock/nginx-pool-ports.lock"
+    if ! flock -n 9; then
+        echo -e "${YELLOW_BOLD}[i] Another 'ports' run is still in progress — skipping this one.${NC}"
+        exec 9>&-
+        return 0
+    fi
+
+    # Per-run temp files: a concurrent writer can never interleave into ours.
+    local tmp_http tmp_https
+    tmp_http=$(mktemp "${map_http}.XXXXXX")
+    tmp_https=$(mktemp "${map_https}.XXXXXX")
 
     echo -e "${BLUE_BOLD}[*] Rebuilding ${CYAN}port_http.map${BLUE_BOLD} and ${CYAN}port_https.map${BLUE_BOLD}…${NC}"
     # Load existing maps to know which domains were already present
@@ -1430,21 +1490,54 @@ update_ports_map() {
     #  Always write maps; only reload nginx when they changed
     #  (cron-safe: runs every few minutes without churning nginx)
     # ======================================================
+    # A duplicate key makes nginx reject the whole config, so never install one.
+    local dupes f
+    for f in "$tmp_http" "$tmp_https"; do
+        dupes=$(awk '!/^#/ && NF {print $1}' "$f" | sort | uniq -d)
+        if [[ -n "$dupes" ]]; then
+            echo -e "${RED}[✗] Refusing to install ${f%.*}: duplicate domain(s):${NC}"
+            echo "$dupes" | sed 's/^/      /'
+            rm -f "$tmp_http" "$tmp_https"
+            exec 9>&-
+            return 1
+        fi
+    done
+
     local maps_changed=0
     cmp -s "$tmp_http"  "$map_http"  || maps_changed=1
     cmp -s "$tmp_https" "$map_https" || maps_changed=1
 
+    echo ""
+    if [[ "$maps_changed" == 0 ]]; then
+        rm -f "$tmp_http" "$tmp_https"
+        echo -e "${GREEN}[✓] Maps unchanged — skipping nginx reload.${NC}"
+        exec 9>&-
+        return 0
+    fi
+
+    # Keep the outgoing maps so a bad generation can be rolled back.
+    cp -a "$map_http"  "${map_http}.bak"  2>/dev/null || true
+    cp -a "$map_https" "${map_https}.bak" 2>/dev/null || true
+
+    chmod 644 "$tmp_http" "$tmp_https"
     mv "$tmp_http"  "$map_http"
     mv "$tmp_https" "$map_https"
 
-    echo ""
-    if [[ "$maps_changed" == 1 ]]; then
-        echo -e "${GREEN}[✓] Maps updated.${NC}"
-        echo -e "${YELLOW_BOLD}Reloading nginx…${NC}"
-        systemctl reload nginx
-    else
-        echo -e "${GREEN}[✓] Maps unchanged — skipping nginx reload.${NC}"
+    # Validate before touching the daemon: a reload on a forking unit exits 0
+    # even when the master refuses the new config, so an untested map would
+    # look successful here and only surface as an [emerg] at the next start.
+    if ! nginx -t >/dev/null 2>&1; then
+        echo -e "${RED}[✗] Generated maps break the nginx config — rolling back:${NC}"
+        nginx -t 2>&1 | sed 's/^/      /' || true
+        cp -a "${map_http}.bak"  "$map_http"  2>/dev/null || true
+        cp -a "${map_https}.bak" "$map_https" 2>/dev/null || true
+        exec 9>&-
+        return 1
     fi
+
+    echo -e "${GREEN}[✓] Maps updated.${NC}"
+    nginx_reload_or_start
+    exec 9>&-
 }
 
 users() {
@@ -1511,7 +1604,7 @@ users() {
         echo
         echo -e "${GREEN}[✓] Updated: ${CYAN}$map_file${NC} (${total_entries} entries)."
         echo -e "${YELLOW_BOLD}Reloading nginx…${NC}"
-        systemctl reload nginx
+        nginx_reload_or_start
     else
         # same → no update needed
         rm -f "$tmp_file"
@@ -1845,7 +1938,7 @@ update_domains() {
         echo
         echo -e "${GREEN}[✓] Updated ${CYAN}$map_file${GREEN} (${total} aliases).${NC}"
         echo -e "${YELLOW_BOLD}Reloading nginx…${NC}"
-        systemctl reload nginx
+        nginx_reload_or_start
     else
         rm -f "$tmp_file"
         echo
@@ -2312,14 +2405,14 @@ reverse_apply() {
     echo
     echo -e "${BLUE_BOLD}[*] ${count} block(s) generated${warn:+, ${YELLOW_BOLD}${warn} warning(s)${BLUE_BOLD}}.${NC}"
     if nginx -t 2>&1 | grep -q "successful"; then
-        systemctl reload nginx
+        nginx_reload_or_start
         echo -e "${GREEN}[✓] nginx reloaded.${NC}"
     else
         echo -e "${RED}[✗] nginx config test FAILED:${NC}"
-        nginx -t 2>&1
+        nginx -t 2>&1 || true
         echo -e "${YELLOW_BOLD}[i] Reverting to empty reverses.conf ...${NC}"
         echo "# nginx-pool reverse apply failed — reverted" > "$REVERSE_CONF_DST"
-        systemctl reload nginx
+        nginx_reload_or_start
         exit 1
     fi
 }
@@ -2342,6 +2435,7 @@ case "$cmd" in
     manage_cert_for_existing_domain "$u" "$d"
     ;;
   ssl-map)  update_ssl_map ;;
+  watchdog) nginx_watchdog ;;
   certs|list-certs|show-certs)
     if [[ "$u" == "--simple" ]]; then
       list_ssl_certs
