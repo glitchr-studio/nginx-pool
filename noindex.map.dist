@@ -1,0 +1,9 @@
+# Domains that must never be indexed, whatever robots.txt they serve
+# themselves. Used by `map $host $is_noindex` in conf.d/pool.conf; the
+# /robots.txt location returns a blanket "Disallow: /" for these.
+#
+# Format:
+#   <domain> 1;
+
+beta.m.apfelschorlette.fr         1;
+citest                            1;

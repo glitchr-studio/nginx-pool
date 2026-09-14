@@ -74,6 +74,12 @@ map $host $is_pool_host {
     localhost              1;
 }
 
+# Domains that must never be indexed, whatever they serve themselves.
+map $host $is_noindex {
+    include /etc/nginx/noindex.map;
+    default 0;
+}
+
 map "$is_pool_host:$host" $host_user {
     default "";
 
@@ -558,15 +564,50 @@ server {
     }
 
     # robots.txt
+    #
+    # This is a single catch-all server block, so this exact-match location
+    # answers /robots.txt for EVERY vhost on the pool. It used to carry no
+    # `root`, so try_files resolved against nginx's compiled-in default and
+    # handed out /etc/nginx/html/robots.txt - a blanket "Disallow: / +
+    # Noindex: /" - to every site alike. Live sites were telling search
+    # engines to stay away and nobody could see why, since each app ships a
+    # perfectly good file of its own.
     location = /robots.txt {
 
         default_type text/plain;
 
+        # Pool hosts are throwaway preview URLs; never index those.
         if ($is_pool_host = 1) {
             return 200 "User-agent: *\nDisallow: /\n";
         }
 
-        try_files /robots.txt =404;
+        # Explicit per-domain opt out (see /etc/nginx/noindex.map).
+        if ($is_noindex = 1) {
+            return 200 "User-agent: *\nDisallow: /\n";
+        }
+
+        # A site backed by a running application answers for itself, exactly
+        # as it does for every other URL. Serving the host checkout instead
+        # would be wrong for the Docker vhosts: their public/ is a volume, so
+        # the copy on disk is whatever the last `git pull` left behind, while
+        # the container serves the file the app actually generates.
+        if (-e $socket)              { return 590; }
+        if ($has_streaming_port = 1) { return 597; }
+        if ($has_port = 1)           { return 591; }
+
+        # Plain-filesystem sites: Symfony-style docroots keep it under
+        # public/, flat ones at the site root, capistrano-style under
+        # current/. A site with none of those keeps the restrictive default
+        # it has been getting all along, so nothing currently hidden becomes
+        # crawlable by surprise.
+        root $webroot;
+        try_files /current/public/robots.txt /public/robots.txt /robots.txt @robots_default;
+    }
+
+    location @robots_default {
+
+        default_type text/plain;
+        return 200 "User-agent: *\nDisallow: /\n";
     }
 
     # direct error access
@@ -680,11 +721,24 @@ server {
         proxy_set_header X-Forwarded-Port  443;
         proxy_set_header Host $host;
 
+        # Same all-or-nothing inheritance rule as the Upgrade/Connection
+        # note below, and it bit the client IP too: because this location
+        # declares headers of its own, the server block's X-Real-IP and
+        # X-Forwarded-For were silently dropped for every Docker-backed
+        # vhost. The container then saw only the docker bridge gateway, so
+        # every application behind this fallback recorded ALL its visitors
+        # as one address (found 2026-09-10: every userConnection row on
+        # m.apfelschorlette.fr said 172.19.0.1). Anything keyed on client
+        # IP - rate limits, captcha failure counters, abuse tracking,
+        # per-IP analytics - was inert pool-wide until these two lines.
+        proxy_set_header X-Real-IP       $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
         # nginx only inherits proxy_set_header directives from the parent
         # context when the current context defines none of its own - since
-        # this location already sets the four headers above, the server
-        # block's Upgrade/Connection headers (needed for WebSocket proxying)
-        # are silently dropped unless redeclared here too.
+        # this location already sets the headers above, the server block's
+        # Upgrade/Connection headers (needed for WebSocket proxying) are
+        # silently dropped unless redeclared here too.
         proxy_http_version 1.1;
         proxy_set_header Upgrade    $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
@@ -754,7 +808,11 @@ server {
 
         # Same all-or-nothing proxy_set_header inheritance gotcha as
         # @port_fallback above - this location already redeclares its own
-        # headers, so Upgrade/Connection need to be explicit here too.
+        # headers, so Upgrade/Connection and the client-IP pair both need to
+        # be explicit here too.
+        proxy_set_header X-Real-IP       $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
         proxy_set_header Upgrade    $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
 

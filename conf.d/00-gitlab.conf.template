@@ -1,0 +1,61 @@
+# GitLab reverse proxy.
+#
+# This file existed only under /etc/nginx/conf.d and was never in the
+# repository, so `make install` could not reproduce the host and any edit
+# was one `apt` away from being lost. It is tracked now.
+#
+# GitLab is NOT behind the pool catch-all: it has its own server_name, so
+# none of pool.conf's rules (robots.txt included) ever applied to it.
+
+server {
+    listen 80;
+    server_name gitlab.glitchr.dev;
+
+    return 301 https://gitlab.glitchr.dev$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name gitlab.glitchr.dev;
+
+    ssl_certificate     /etc/letsencrypt/live/gitlab.glitchr.dev/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/gitlab.glitchr.dev/privkey.pem;
+
+    # Required headers
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+
+    # GitLab reverse proxy
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+
+    # ----------------------------------------------------------------
+    # Keep GitLab out of search engines.
+    #
+    # GitLab ships a robots.txt that is written for gitlab.com: it assumes
+    # you WANT the instance indexed and only trims the noisiest routes. It
+    # leaves /<group>/<project>/-/blob/, /-/tree/, /-/refs/, /-/branches,
+    # /-/tags and every *.atom feed crawlable - and a repository browser is
+    # a link farm, so a crawler that finds one commit page finds thousands.
+    # That is how a private instance on a 4-CPU box ends up serving 50k
+    # requests in a day.
+    #
+    # Disallow: / stops the crawl. X-Robots-Tag covers the rest: a URL that
+    # robots.txt forbids can still be listed by Google if it is linked from
+    # somewhere else, and a crawler that ignores robots.txt honours the
+    # header often enough to be worth sending.
+    # ----------------------------------------------------------------
+    location = /robots.txt {
+        default_type text/plain;
+        add_header X-Robots-Tag "noindex, nofollow" always;
+        return 200 "User-agent: *\nDisallow: /\n";
+    }
+
+    location / {
+        add_header X-Robots-Tag "noindex, nofollow" always;
+        proxy_pass http://127.0.0.1:2443;
+    }
+}

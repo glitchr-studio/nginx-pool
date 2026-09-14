@@ -20,6 +20,7 @@ config:
 	@sed -e "s/{{DOMAIN}}/$(DOMAIN_ESC)/g" \
 	 	 -e "s/{{DOMAIN_ESC}}/$(DOMAIN_ESC2)/g" \
 	 	 conf.d/pool.conf.template > conf.d/pool.conf
+	@cp conf.d/00-gitlab.conf.template conf.d/00-gitlab.conf
 
 nginx:
 	@curl -fsSL https://nginx.org/keys/nginx_signing.key   | sudo gpg --dearmor -o /usr/share/keyrings/nginx-keyring.gpg
@@ -40,8 +41,9 @@ php:
 install: config automation
 	@cp bin/* /usr/local/bin/
 	@cp nginx.conf /etc/nginx/
+	@cp -n noindex.map.dist /etc/nginx/noindex.map 2>/dev/null || true
 	@cp conf.d/*.conf /etc/nginx/conf.d/
-	@touch /etc/nginx/user.map /etc/nginx/legacy.map /etc/nginx/domain.map /etc/nginx/lock.map /etc/nginx/ssl_cert.map
+	@touch /etc/nginx/user.map /etc/nginx/legacy.map /etc/nginx/domain.map /etc/nginx/lock.map /etc/nginx/ssl_cert.map /etc/nginx/noindex.map
 	@touch /etc/nginx/port_http.map /etc/nginx/port_https.map
 	@/usr/local/bin/nginx-pool logs
 	@$(MAKE) reload
