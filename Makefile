@@ -45,6 +45,12 @@ install: config automation
 	@cp conf.d/*.conf /etc/nginx/conf.d/
 	@touch /etc/nginx/user.map /etc/nginx/legacy.map /etc/nginx/domain.map /etc/nginx/lock.map /etc/nginx/ssl_cert.map /etc/nginx/noindex.map
 	@touch /etc/nginx/port_http.map /etc/nginx/port_https.map
+	@# Keepalive upstreams for the Docker vhosts. pool.conf includes the
+	@# directory with a glob (harmless when empty) but the two maps are plain
+	@# `include`s inside map blocks, where a missing file is fatal - so they
+	@# must exist before the first `nginx-pool ports` run fills them in.
+	@install -d /etc/nginx/upstreams.d
+	@touch /etc/nginx/upstream_http.map /etc/nginx/upstream_https.map
 	@/usr/local/bin/nginx-pool logs
 	@$(MAKE) reload
 
