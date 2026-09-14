@@ -644,9 +644,8 @@ server {
         # would be wrong for the Docker vhosts: their public/ is a volume, so
         # the copy on disk is whatever the last `git pull` left behind, while
         # the container serves the file the app actually generates.
-        if (-e $socket)              { return 590; }
-        if ($has_streaming_port = 1) { return 597; }
-        if ($has_port = 1)           { return 591; }
+        if (-e $socket)    { return 596; }
+        if ($has_port = 1) { return 596; }
 
         # Plain-filesystem sites: Symfony-style docroots keep it under
         # public/, flat ones at the site root, capistrano-style under
@@ -661,6 +660,65 @@ server {
 
         default_type text/plain;
         return 200 "User-agent: *\nDisallow: /\n";
+    }
+
+    # Its own proxy rather than @port_fallback, for one directive:
+    # proxy_intercept_errors. An application that ships no robots.txt answers
+    # 404, and a 404 on robots.txt means "no rules at all" - so dispatching
+    # blindly would flip a site from blocked to fully crawlable the day this
+    # file changed, which is exactly what the paragraph above promises not to
+    # do. No tenant is in that position today - every vhost this host actually
+    # serves ships a robots.txt or is covered by noindex.map - so this is a
+    # guard for the next one, not a repair. proxy_intercept_errors takes no
+    # variable, so it cannot be switched on inside the shared fallback for
+    # this one URI; the twenty lines are duplicated deliberately.
+    #
+    # Only 404/403 are caught. A 5xx or a timeout must NOT quietly become
+    # "Disallow: /": a crawler caches robots.txt, and an outage that answers
+    # 200-and-stay-away outlives the outage by days. Those keep erroring, and
+    # a crawler that cannot fetch robots.txt at all backs off on its own.
+    error_page 596 = @robots_proxy;
+    location @robots_proxy {
+
+        internal;
+        set $code 596;
+
+        proxy_intercept_errors on;
+        error_page 404 403 = @robots_default;
+
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Ssl   on;
+        proxy_set_header X-Forwarded-Port  443;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection $connection_keepalive;
+        proxy_ssl_session_reuse on;
+        proxy_redirect off;
+
+        if (-e $socket) {
+            proxy_pass http://unix:$socket:;
+            break;
+        }
+
+        if ($prefer_https_port != 0) {
+            proxy_pass https://$prefer_https_upstream$rewritten_uri;
+            break;
+        }
+
+        if ($port_https != 0) {
+            proxy_pass https://$upstream_https$rewritten_uri;
+            break;
+        }
+
+        if ($port_http != 0) {
+            proxy_pass http://$upstream_http$rewritten_uri;
+            break;
+        }
+
+        return 404;
     }
 
     # direct error access
