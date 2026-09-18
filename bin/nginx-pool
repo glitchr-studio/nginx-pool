@@ -66,6 +66,7 @@ SHOW_BACKEND=false
 CLEAR_PORTS=false
 IS_DEDICATED=false
 EXTEND_CERT=false
+BARE_CERT=false
 
 # Reverse proxy flags
 REVERSE_CERT=""
@@ -101,6 +102,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dedicated)
             IS_DEDICATED=true
+            shift
+            ;;
+        --bare)
+            BARE_CERT=true
             shift
             ;;
         --extend-cert)
@@ -173,11 +178,19 @@ usage() {
     echo -e "    $me list [--local] [--backend]"
     echo
     echo -e "  ${GREEN}SSL Certificate Management:${NC}"
-    echo -e "    $me cert <domain> [--master <cert_family>]            # Create/extend cert for domain"
+    echo -e "    $me cert <domain> [--master <cert_family>] [--bare]   # Create/extend cert (--bare: no vhost needed)"
     echo -e "    $me certs [<user>]                                    # View certs (all, or scoped to user)"
     echo -e "    $me renew                                             # Renew all certs (cron-safe)"
     echo -e "    $me ssl-map                                           # Rebuild ssl_cert.map"
+    echo -e "    $me ssl-anon                                          # Create the anonymous fallback cert (_anon)"
     echo -e "    $me watchdog                                          # Restart nginx if its unit has failed (cron)"
+    echo
+    echo -e "  ${GREEN}Dynamic DNS:${NC} ${GRAY}(ddclient / Gandi LiveDNS)${NC}"
+    echo -e "    $me ddns list                                         # Show configured DDNS hosts"
+    echo -e "    $me ddns status                                       # Per-host health (state, IP, last update)"
+    echo -e "    $me ddns check                                        # Quiet form for cron; non-zero if stale"
+    echo -e "    $me ddns add <domain> [zone]                          # Add a host (apex handled automatically)"
+    echo -e "    $me ddns remove <domain> [zone]                       # Remove a host"
     echo
     echo -e "  ${GREEN}Reverse Proxy Management:${NC} ${GRAY}('rev' is a shorthand for 'reverse')${NC}"
     echo -e "    $me reverses [<filter>]                               # List all reverse proxies (quick shortcut)"
@@ -367,6 +380,108 @@ fix_acl() {
     echo -e "${GREEN}[✓] ACL permissions updated for ${CYAN}$user${GREEN}${domain:+/$domain}.${NC}"
 }
 
+# Name of the fallback certificate served for any host the pool does not know.
+# The leading underscore keeps it out of the way of real lineages (no domain
+# can start with one) and marks it as not-a-tenant everywhere it shows up.
+ANON_CERT_NAME="_anon"
+ANON_CERT_DIR="/etc/letsencrypt/live/$ANON_CERT_NAME"
+
+# Is there a usable certificate under this lineage name?
+#
+# `update_ssl_map` used to emit "$MASTER" whenever a domain had no certificate
+# of its own, without ever checking that $MASTER existed. MASTER defaults to
+# "localhost", and `cert_renew` - which runs hourly from cron - calls
+# update_ssl_map with no --master flag, so every such domain was mapped to a
+# /etc/letsencrypt/live/localhost that has never existed. nginx cannot answer
+# a handshake with a missing file, so those names failed to negotiate TLS at
+# all. Nothing pointed at them was live, which is the only reason it went
+# unnoticed. Every cert_name is now checked before it is written.
+cert_lineage_exists() {
+    local name="$1"
+    [[ -n "$name" ]] || return 1
+    [[ -s "/etc/letsencrypt/live/$name/fullchain.pem" ]] &&
+    [[ -s "/etc/letsencrypt/live/$name/privkey.pem" ]]
+}
+
+# Does this lineage actually carry a name that covers $domain?
+#
+# Existing is not the same as applicable. The parent-certificate walk used to
+# stop at the first lineage it found above a domain and serve it, assuming a
+# parent must cover its children - which is only true when the parent cert was
+# issued with those SANs. chapaland.com holds a single-name certificate, so
+# www.chapaland.com resolved to it and was served a certificate that does not
+# mention www at all: a warning for a domain whose own fallback would have been
+# fine. The SAN list is the only authority on this, so it is read rather than
+# inferred. Wildcards are honoured for one label, as TLS defines them.
+cert_covers_domain() {
+    local name="$1" domain="$2"
+    cert_lineage_exists "$name" || return 1
+
+    local sans
+    # Strip whitespace per line with sed, never with a trailing `tr -d`:
+    # tr deletes newlines too, which collapses a multi-SAN certificate into a
+    # single run-together token that matches nothing. Single-SAN certs still
+    # appeared to work, which made the breakage look domain-specific.
+    sans=$(openssl x509 -in "/etc/letsencrypt/live/$name/fullchain.pem" \
+               -noout -ext subjectAltName 2>/dev/null |
+           tr ',' '\n' | sed -n 's/.*DNS://p' | sed 's/[[:space:]]//g')
+    [[ -n "$sans" ]] || return 1
+
+    local san
+    while IFS= read -r san; do
+        [[ -z "$san" ]] && continue
+        [[ "$san" == "$domain" ]] && return 0
+        # *.example.com matches one label: a.example.com, never a.b.example.com
+        if [[ "$san" == '*.'* && "$domain" == *.* ]]; then
+            [[ "${domain#*.}" == "${san#\*.}" ]] && return 0
+        fi
+    done <<< "$sans"
+
+    return 1
+}
+
+# Create the anonymous fallback certificate if it is missing.
+#
+# Self-signed on purpose: this certificate is never meant to validate. Its job
+# is to let the handshake complete while telling the client nothing, so that an
+# unknown host gets a warning page containing no hostname, no organisation and
+# no e-mail address rather than a trusted certificate naming real tenants.
+# Subject is CN=invalid (RFC 6761 reserves .invalid and it can never be a real
+# name) with no SAN, no O and no OU. 10-year lifetime so it never needs renewal
+# and never appears in Certificate Transparency logs.
+ensure_anon_cert() {
+    require_root
+
+    if cert_lineage_exists "$ANON_CERT_NAME"; then
+        return 0
+    fi
+
+    echo -e "${BLUE_BOLD}[*] Creating anonymous fallback certificate (${CYAN}$ANON_CERT_NAME${BLUE_BOLD})...${NC}"
+    mkdir -p "$ANON_CERT_DIR"
+
+    # -nodes: nginx must read the key unattended at startup.
+    if ! openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$ANON_CERT_DIR/privkey.pem" \
+            -out    "$ANON_CERT_DIR/fullchain.pem" \
+            -days 3650 -subj "/CN=invalid" 2>/dev/null; then
+        echo -e "${RED}[✗] Could not create the anonymous certificate.${NC}"
+        return 1
+    fi
+
+    chmod 600 "$ANON_CERT_DIR/privkey.pem"
+    chmod 644 "$ANON_CERT_DIR/fullchain.pem"
+
+    # chmod must come before this, never after: /etc/letsencrypt/live carries a
+    # default ACL granting www-data read, and chmod on an ACL-bearing file
+    # rewrites the mask from the group bits - which is 000 here, masking the
+    # www-data entry off again. nginx workers then cannot read the key and every
+    # handshake that lands on the fallback fails outright. Re-applying the ACL
+    # afterwards restores the mask.
+    fix_letsencrypt_permissions
+
+    echo -e "${GREEN}[✓] Anonymous fallback certificate created.${NC}"
+}
+
 add_cert_to_ssl_map() {
     require_root
 
@@ -409,6 +524,10 @@ update_ssl_map() {
 
     echo -e "${BLUE_BOLD}[*] Rebuilding SSL certificate map...${NC}"
 
+    # The map's `default` in pool.conf points at this, and entries below fall
+    # back to it, so it has to exist before the map is written.
+    ensure_anon_cert
+
     # Header
     {
         echo "# Auto-generated SSL certificate mapping"
@@ -444,26 +563,58 @@ update_ssl_map() {
                 local cert_name
 
                 # Check if it's a pool domain (subdomain of MASTER)
-                if [[ "$domain" =~ \.$MASTER$ ]]; then
+                if [[ "$domain" =~ \.$MASTER$ ]] && cert_lineage_exists "$MASTER"; then
                     # Pool domain → use MASTER certificate
                     cert_name="$MASTER"
                     echo -e "${CYAN}→ ${domain}${GRAY} (pool)${NC} → ${GREEN}$cert_name${NC}"
                 else
-                    # Dedicated domain → check if certificate exists
-                    if [[ -d "/etc/letsencrypt/live/$domain" ]]; then
+                    # Dedicated domain → check if certificate exists.
+                    #
+                    # Tests the certificate files, not just the directory. A
+                    # lineage can outlive its contents: certbot leaves
+                    # live/<name>/ in place with fullchain.pem and privkey.pem
+                    # still symlinked into archive/<name>/, and if those
+                    # archive files go the symlinks are left dangling. The
+                    # directory still exists, so a -d test calls the cert
+                    # present and maps the domain to it - and every handshake
+                    # for that name then fails, because nginx has nothing to
+                    # send. georges.glitchr.dev and georges.mx.glitchr.dev were
+                    # both in exactly that state.
+                    if cert_covers_domain "$domain" "$domain"; then
                         cert_name="$domain"
                         echo -e "${CYAN}→ ${domain}${GRAY} (dedicated)${NC} → ${GREEN}$cert_name${NC}"
                     else
-                        # Check for parent domain certificate (e.g., www.example.com → example.com)
-                        local parent_domain
-                        parent_domain=$(echo "$domain" | sed 's/^[^.]*\.//')
-                        if [[ -d "/etc/letsencrypt/live/$parent_domain" ]]; then
+                        # Check for a parent domain certificate, walking up one
+                        # label at a time (www.example.com → example.com).
+                        #
+                        # The walk continues past the first parent rather than
+                        # testing only one level: georges.mx.glitchr.dev has no
+                        # mx.glitchr.dev lineage, but the glitchr.dev one above
+                        # it lists the name in its SANs and is the right
+                        # certificate to serve. Stopping at one level sent it to
+                        # the anonymous fallback and produced a warning for a
+                        # host that has a perfectly good certificate. Stops at
+                        # two labels, since a single label is a public suffix.
+                        local parent_domain="$domain"
+                        while [[ "$parent_domain" == *.*.* ]]; do
+                            parent_domain="${parent_domain#*.}"
+                            cert_covers_domain "$parent_domain" "$domain" && break
+                        done
+
+                        if cert_covers_domain "$parent_domain" "$domain"; then
                             cert_name="$parent_domain"
                             echo -e "${CYAN}→ ${domain}${GRAY} (parent cert)${NC} → ${GREEN}$cert_name${NC}"
-                        else
-                            # Fallback to MASTER
+                        elif cert_lineage_exists "$MASTER"; then
+                            # Fallback to MASTER, but only if it really exists
                             cert_name="$MASTER"
                             echo -e "${YELLOW_BOLD}→ ${domain}${YELLOW_BOLD} (no cert, using fallback)${NC} → ${GREEN}$cert_name${NC}"
+                        else
+                            # No certificate anywhere for this name. Mapping it
+                            # to a lineage that does not exist breaks the
+                            # handshake outright; the anonymous cert at least
+                            # negotiates, and leaks nothing while doing so.
+                            cert_name="$ANON_CERT_NAME"
+                            echo -e "${YELLOW_BOLD}→ ${domain}${YELLOW_BOLD} (no cert, anonymous fallback)${NC} → ${GREEN}$cert_name${NC}"
                         fi
                     fi
                 fi
@@ -474,6 +625,30 @@ update_ssl_map() {
             done
         fi
     done < <(getent passwd)
+
+    # Bare certificates: a name we hold a certificate for that has no vhost.
+    #
+    # The scan above walks user directories, so a domain deliberately pointed
+    # here without being served - a parked name, or one left to the 418 default
+    # like chapaland.com - contributes no entry and drops to the anonymous
+    # fallback on the next rebuild, silently undoing `nginx-pool cert --bare`
+    # within the hour. Any lineage that genuinely covers its own name is
+    # therefore re-asserted here. Lineages that do not (certbot's -0001
+    # duplicates, or a name whose SANs have moved on) fail the coverage test
+    # and are skipped, so this cannot resurrect a stale mapping.
+    local live_name
+    for live_name in /etc/letsencrypt/live/*; do
+        [[ -d "$live_name" ]] || continue
+        live_name=$(basename "$live_name")
+        [[ "$live_name" == "$ANON_CERT_NAME" ]] && continue
+        [[ -n "${cert_map[$live_name]:-}" ]] && continue
+        cert_covers_domain "$live_name" "$live_name" || continue
+
+        cert_map["$live_name"]="$live_name"
+        printf "%-40s %s;\n" "$live_name" "$live_name" >> "$tmp_file"
+        total=$((total + 1))
+        echo -e "${CYAN}→ ${live_name}${GRAY} (bare cert, no vhost)${NC} → ${GREEN}$live_name${NC}"
+    done
 
     # Wildcard patterns (add at end)
     echo >> "$tmp_file"
@@ -596,18 +771,46 @@ manage_cert_for_existing_domain() {
     done
 
     if [[ -z "$found_path" ]]; then
-        echo -e "${RED}[!] Domain ${CYAN}$domain${RED} not found in any user directory.${NC}"
-        echo -e "${YELLOW_BOLD}[i] Searched for: ${CYAN}*/www/$fs_domain${NC}"
-        echo -e "${YELLOW_BOLD}[i] Use: ${CYAN}nginx-pool add <user> $domain --master $cert_family --extend-cert${NC}"
-        return 1
+        # A certificate does not actually require a vhost. A domain can point
+        # here deliberately without serving anything - chapaland.com resolves to
+        # this host on purpose and answers 418 from the default server - and
+        # such a domain still wants its own certificate, otherwise it falls back
+        # to _anon and every visitor gets a warning. Refusing outright forced
+        # the only documented way forward to be `nginx-pool add`, which creates
+        # a vhost and so stops the domain being an unknown host at all.
+        #
+        # Still gated behind --bare rather than assumed: with no vhost there is
+        # nothing to confirm the name was spelled correctly, and a typo here
+        # spends a real Let's Encrypt attempt against their rate limit.
+        if [[ "$BARE_CERT" != "true" ]]; then
+            echo -e "${RED}[!] Domain ${CYAN}$domain${RED} not found in any user directory.${NC}"
+            echo -e "${YELLOW_BOLD}[i] Searched for: ${CYAN}*/www/$fs_domain${NC}"
+            echo
+            echo -e "${YELLOW_BOLD}[i] To serve this domain, create the vhost:${NC}"
+            echo -e "    ${CYAN}nginx-pool add <user> $domain --master $cert_family --extend-cert${NC}"
+            echo -e "${YELLOW_BOLD}[i] To certificate it without serving anything (parked / 418 teapot):${NC}"
+            echo -e "    ${CYAN}nginx-pool cert $domain --bare${NC}"
+            return 1
+        fi
+
+        echo -e "${YELLOW_BOLD}[i] No vhost for ${CYAN}$domain${YELLOW_BOLD} — issuing a bare certificate.${NC}"
+        echo -e "${GRAY}    The domain keeps whatever the default server answers (418), but${NC}"
+        echo -e "${GRAY}    presents its own certificate instead of the anonymous fallback.${NC}"
+        echo -e "${GRAY}    ACME HTTP-01 still works: the acme-challenge location is matched${NC}"
+        echo -e "${GRAY}    ahead of the dispatcher, so it is reachable for unknown hosts.${NC}"
+        echo
+    else
+        echo -e "${GREEN}[✓] Found domain ${CYAN}$domain${GREEN} in ${CYAN}$found_path${NC}"
+        echo -e "${GRAY}    Owner: ${CYAN}$found_user${NC}"
+        echo
     fi
 
-    echo -e "${GREEN}[✓] Found domain ${CYAN}$domain${GREEN} in ${CYAN}$found_path${NC}"
-    echo -e "${GRAY}    Owner: ${CYAN}$found_user${NC}"
-    echo
-
-    # Add to SSL map
-    add_cert_to_ssl_map "$domain" "$cert_family"
+    # The ssl_cert.map entry is deliberately NOT written here. Both branches
+    # below add it themselves, and only once their certificate actually
+    # exists. Writing it up front pointed the domain at a lineage that had not
+    # been created yet, so a failed issuance left the map naming a missing
+    # certificate - which is the one state guaranteed to break the handshake
+    # outright rather than fall back to something serviceable.
 
     # Check if certificate exists
     if [[ ! -d "/etc/letsencrypt/live/$cert_family" ]]; then
@@ -687,7 +890,19 @@ create_ssl_cert() {
             has_account=1
         fi
 
-        read -rp "Email address for Let's Encrypt (optional): " email
+        # Only prompt when there is a terminal to answer with, and never let
+        # the prompt itself be fatal. The script runs under `set -e`, and a
+        # `read` at EOF - no TTY, stdin redirected, called from cron or a
+        # script - returns non-zero, which aborted the whole run silently at
+        # this exact line, after announcing that it was creating the
+        # certificate and before certbot was ever invoked. The failure looked
+        # like certbot dying, but nothing had run at all.
+        local email=""
+        if [[ -t 0 ]]; then
+            read -rp "Email address for Let's Encrypt (optional): " email || email=""
+        else
+            echo -e "${GRAY}    (non-interactive: no e-mail prompt)${NC}"
+        fi
 
         # Prepare email flags
         local email_flag=""
@@ -2549,6 +2764,256 @@ reverse_apply() {
     fi
 }
 
+# ======================================================
+# Dynamic DNS (ddclient / Gandi LiveDNS)
+# ======================================================
+#
+# This pool is reached over a residential line whose WAN address is not
+# guaranteed to be stable, so the A records that point at it have to be kept
+# in step with it. ddclient already did that job, badly and silently: it had
+# never completed a single successful update in the whole retained log history
+# (every cycle returned 403, `mtime=0`, `status-ipv4=bad`) and nothing ever
+# said so. The records looked healthy only because the ISP happened not to
+# move the address. `nginx-pool ddns status` exists so that failure is visible
+# on demand, and `ddns check` so the watchdog can notice it unattended.
+
+DDCLIENT_CONF="/etc/ddclient/ddclient.conf"
+DDCLIENT_CACHE="/var/cache/ddclient/ddclient.cache"
+
+# Registrable zone for a domain: the last two labels.
+#
+# Good enough for .com/.fr/.dev/.io, which is everything this pool serves. It
+# is wrong for multi-part suffixes (foo.co.uk would yield "co.uk"), so both
+# `ddns add` and `ddns remove` take an optional explicit zone as a second
+# argument for that case rather than pretending to know the public suffix list.
+ddns_zone_for() {
+    local domain="$1"
+    awk -F. '{ if (NF>=2) print $(NF-1)"."$NF; else print $0 }' <<< "$domain"
+}
+
+# How this domain must be spelled on a ddclient host line.
+#
+# ddclient's Gandi protocol derives the LiveDNS record name by stripping the
+# zone off the host name:
+#
+#     (my $hostname = $h) =~ s/\.\Q$config{$h}{zone}\E$//;
+#
+# For a subdomain that yields the label ("georges.glitchr.dev" -> "georges").
+# For an apex there is no leading dot to strip, so "chapaland.com" would come
+# out as "chapaland.com" and ddclient would PUT to
+# /livedns/domains/chapaland.com/records/chapaland.com/A - a record name Gandi
+# does not serve. Spelling the apex "@.<zone>" makes the same substitution
+# yield "@", which is the name LiveDNS actually uses for it.
+ddns_host_for() {
+    local domain="$1" zone="$2"
+    if [[ "$domain" == "$zone" ]]; then
+        echo "@.$zone"
+    else
+        echo "$domain"
+    fi
+}
+
+ddns_require_conf() {
+    if [[ ! -f "$DDCLIENT_CONF" ]]; then
+        echo -e "${RED}[!] $DDCLIENT_CONF not found - is ddclient installed?${NC}"
+        return 1
+    fi
+}
+
+# Every host line in the config, with the zone in effect for it.
+# Assignments accumulate as defaults for the lines that follow, and a line of
+# the form "var=value host" overrides them for that host only, so the file has
+# to be walked in order rather than grepped.
+ddns_entries() {
+    require_root
+    ddns_require_conf || return 1
+
+    awk '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        {
+            line = $0
+            local_zone = ""
+            host = ""
+            # Leading var=value pairs, then an optional host at the end.
+            n = split(line, tok, /[[:space:]]+/)
+            for (i = 1; i <= n; i++) {
+                if (tok[i] ~ /^zone=/)        { sub(/^zone=/, "", tok[i]); local_zone = tok[i] }
+                else if (tok[i] ~ /=/)        { continue }
+                else if (tok[i] != "")        { host = tok[i] }
+            }
+            if (local_zone != "" && host == "") { gzone = local_zone; next }
+            if (host != "") {
+                z = (local_zone != "" ? local_zone : gzone)
+                printf "%s\t%s\n", host, z
+            }
+        }
+    ' "$DDCLIENT_CONF"
+}
+
+ddns_list() {
+    require_root
+    ddns_require_conf || return 1
+
+    echo -e "${BLUE_BOLD}[*] Dynamic DNS entries in $DDCLIENT_CONF:${NC}"
+    echo
+    printf "  %-26s %-20s %s\n" "HOST" "ZONE" "LIVEDNS RECORD"
+    echo "  ---------------------------------------------------------------------"
+
+    local count=0
+    while IFS=$'\t' read -r host zone; do
+        [[ -n "$host" ]] || continue
+        local record="${host%".$zone"}"
+        [[ "$record" == "$host" ]] && record="$host"
+        printf "  %-26s %-20s %s\n" "$host" "$zone" "/$zone/records/$record/A"
+        count=$((count + 1))
+    done < <(ddns_entries)
+
+    echo
+    echo -e "  ${GRAY}$count entr$([[ $count -eq 1 ]] && echo y || echo ies)${NC}"
+}
+
+# Health of each entry, read back from ddclient's own cache.
+#
+# The two fields that matter are status-ipv4 and mtime. A host that has never
+# been written carries mtime=0, which is exactly the state this pool sat in
+# for over a year while looking fine from the outside.
+ddns_status() {
+    require_root
+    ddns_require_conf || return 1
+
+    echo -e "${BLUE_BOLD}[*] Dynamic DNS status:${NC}"
+    echo
+
+    if [[ ! -s "$DDCLIENT_CACHE" ]]; then
+        echo -e "${YELLOW_BOLD}[!] No ddclient cache at $DDCLIENT_CACHE${NC}"
+        echo -e "    ${GRAY}ddclient has not completed a cycle since the cache was last cleared.${NC}"
+        return 1
+    fi
+
+    printf "  %-26s %-8s %-16s %s\n" "HOST" "STATE" "IP" "LAST UPDATE"
+    echo "  -----------------------------------------------------------------------"
+
+    local bad=0
+    while IFS=$'\t' read -r host _zone; do
+        [[ -n "$host" ]] || continue
+
+        local line status ip mtime when state colour
+        line=$(grep -F "host=$host," "$DDCLIENT_CACHE" 2>/dev/null | tail -1)
+
+        if [[ -z "$line" ]]; then
+            printf "  ${YELLOW_BOLD}%-26s %-8s %-16s %s${NC}\n" "$host" "UNSEEN" "-" "not in cache"
+            bad=$((bad + 1))
+            continue
+        fi
+
+        status=$(sed -n 's/.*status-ipv4=\([^,]*\).*/\1/p' <<< "$line")
+        ip=$(sed -n 's/.*[,[:space:]]ip=\([^,]*\).*/\1/p' <<< "$line")
+        mtime=$(sed -n 's/.*mtime=\([0-9]*\).*/\1/p' <<< "$line")
+
+        if [[ "${mtime:-0}" -gt 0 ]]; then
+            when=$(date -d "@$mtime" '+%Y-%m-%d %H:%M' 2>/dev/null)
+        else
+            when="never"
+        fi
+
+        if [[ "$status" == "good" && "${mtime:-0}" -gt 0 ]]; then
+            state="OK";  colour="$GREEN"
+        else
+            state="FAIL"; colour="$RED"; bad=$((bad + 1))
+        fi
+
+        printf "  ${colour}%-26s %-8s %-16s %s${NC}\n" "$host" "$state" "${ip:--}" "$when"
+    done < <(ddns_entries)
+
+    echo
+    if [[ $bad -gt 0 ]]; then
+        echo -e "  ${RED}[✗] $bad entr$([[ $bad -eq 1 ]] && echo y || echo ies) not updating.${NC}"
+        echo -e "  ${GRAY}Check: journalctl -u ddclient -n 50${NC}"
+        return 1
+    fi
+    echo -e "  ${GREEN}[✓] All entries updating.${NC}"
+}
+
+# Quiet form for cron/watchdog: prints only when something is wrong.
+ddns_check() {
+    require_root
+    ddns_require_conf || return 0
+
+    [[ -s "$DDCLIENT_CACHE" ]] || { echo "ddns: no ddclient cache - no successful cycle"; return 1; }
+
+    local bad=0
+    while IFS=$'\t' read -r host _zone; do
+        [[ -n "$host" ]] || continue
+        local line status mtime
+        line=$(grep -F "host=$host," "$DDCLIENT_CACHE" 2>/dev/null | tail -1)
+        status=$(sed -n 's/.*status-ipv4=\([^,]*\).*/\1/p' <<< "$line")
+        mtime=$(sed -n 's/.*mtime=\([0-9]*\).*/\1/p' <<< "$line")
+        if [[ "$status" != "good" || "${mtime:-0}" -eq 0 ]]; then
+            echo "ddns: $host is not updating (status=${status:-missing} mtime=${mtime:-0})"
+            bad=$((bad + 1))
+        fi
+    done < <(ddns_entries)
+
+    [[ $bad -eq 0 ]]
+}
+
+ddns_add() {
+    require_root
+    ddns_require_conf || return 1
+
+    local domain="$1"
+    local zone="${2:-$(ddns_zone_for "$domain")}"
+    local host; host=$(ddns_host_for "$domain" "$zone")
+
+    if ddns_entries | cut -f1 | grep -qx "$host"; then
+        echo -e "${YELLOW_BOLD}[i] ${CYAN}$host${YELLOW_BOLD} is already configured.${NC}"
+        return 0
+    fi
+
+    cp -a "$DDCLIENT_CONF" "$DDCLIENT_CONF.bak-$(date +%Y%m%d%H%M%S)"
+
+    {
+        echo
+        echo "# $domain -> this host's dynamic WAN address (added by nginx-pool ddns add)"
+        if [[ "$host" != "$domain" ]]; then
+            echo "# Spelled @.$zone so ddclient resolves it to the apex record; see"
+            echo "# ddns_host_for() in nginx-pool for why the bare apex does not work."
+        fi
+        echo "zone=$zone $host"
+    } >> "$DDCLIENT_CONF"
+
+    echo -e "${GREEN}[✓] Added ${CYAN}$host${GREEN} (zone $zone).${NC}"
+    echo -e "${YELLOW_BOLD}[*] Restarting ddclient...${NC}"
+    systemctl restart ddclient 2>/dev/null &&
+        echo -e "${GREEN}[✓] ddclient restarted. Check: nginx-pool ddns status${NC}" ||
+        echo -e "${RED}[!] Could not restart ddclient.${NC}"
+}
+
+ddns_remove() {
+    require_root
+    ddns_require_conf || return 1
+
+    local domain="$1"
+    local zone="${2:-$(ddns_zone_for "$domain")}"
+    local host; host=$(ddns_host_for "$domain" "$zone")
+
+    if ! ddns_entries | cut -f1 | grep -qx "$host"; then
+        echo -e "${YELLOW_BOLD}[i] ${CYAN}$host${YELLOW_BOLD} is not configured.${NC}"
+        return 0
+    fi
+
+    cp -a "$DDCLIENT_CONF" "$DDCLIENT_CONF.bak-$(date +%Y%m%d%H%M%S)"
+
+    # Only drop the host line itself. Bare host lines inherit the settings
+    # above them, so removing anything else would silently re-home the
+    # entries that follow.
+    sed -i "/^[[:space:]]*\(zone=[^[:space:]]*[[:space:]]\+\)\?$(sed 's/[.[\*^$]/\\&/g' <<< "$host")[[:space:]]*$/d" "$DDCLIENT_CONF"
+
+    echo -e "${GREEN}[✓] Removed ${CYAN}$host${GREEN}.${NC}"
+    systemctl restart ddclient 2>/dev/null &&
+        echo -e "${GREEN}[✓] ddclient restarted.${NC}"
+}
+
 # ---------- Main ----------
 cmd="${1:-}"
 u="${2:-}"
@@ -2567,6 +3032,19 @@ case "$cmd" in
     manage_cert_for_existing_domain "$u" "$d"
     ;;
   ssl-map)  update_ssl_map ;;
+  ssl-anon) ensure_anon_cert ;;
+  ddns)
+    case "$u" in
+      add)        [[ -z "$d" ]] && { echo -e "${RED}[!] Usage: nginx-pool ddns add <domain> [zone]${NC}"; exit 1; }
+                  ddns_add "$d" "$e" ;;
+      remove|rm)  [[ -z "$d" ]] && { echo -e "${RED}[!] Usage: nginx-pool ddns remove <domain> [zone]${NC}"; exit 1; }
+                  ddns_remove "$d" "$e" ;;
+      status)     ddns_status ;;
+      check)      ddns_check ;;
+      list|"")    ddns_list ;;
+      *)          echo -e "${RED}[!] Unknown ddns subcommand: $u${NC}"; exit 1 ;;
+    esac
+    ;;
   watchdog) nginx_watchdog ;;
   certs|list-certs|show-certs)
     if [[ "$u" == "--simple" ]]; then
