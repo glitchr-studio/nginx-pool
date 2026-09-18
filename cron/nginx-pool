@@ -19,3 +19,13 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Rotate the per-vhost app logs.
 15 0 * * * root flock -n /run/lock/nginx-pool-logs.lock /usr/local/bin/nginx-pool logs 2>&1 | /usr/bin/logger -t nginx-pool-logs
+
+# Report dynamic DNS entries that have stopped updating.
+#
+# ddclient fails silently: it logs each rejection and carries on, so a dead
+# credential looks exactly like a healthy setup from the outside for as long as
+# the ISP leaves the address alone. This pool sat in that state for over a year
+# with `mtime=0` on every host. `ddns check` prints nothing while the entries
+# are current and one line per stale entry otherwise, so syslog stays quiet
+# until there is something to say.
+*/30 * * * * root /usr/local/bin/nginx-pool ddns check 2>&1 | /usr/bin/logger -t nginx-pool-ddns
