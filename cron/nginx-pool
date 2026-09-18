@@ -20,6 +20,14 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Rotate the per-vhost app logs.
 15 0 * * * root flock -n /run/lock/nginx-pool-logs.lock /usr/local/bin/nginx-pool logs 2>&1 | /usr/bin/logger -t nginx-pool-logs
 
+# Enforce .htaccess Basic-auth declarations as real nginx auth.
+#
+# nginx ignores .htaccess, so a tenant who drops one in believes a directory is
+# private while it is served wide open - and will not think to run a command
+# afterwards, because on Apache there was never a command to run. Rebuilding on
+# a timer closes that window. Silent and reload-free when nothing changed.
+*/15 * * * * root flock -n /run/lock/nginx-pool-auth.lock /usr/local/bin/nginx-pool auth 2>&1 | /usr/bin/logger -t nginx-pool-auth
+
 # Report dynamic DNS entries that have stopped updating.
 #
 # ddclient fails silently: it logs each rejection and carries on, so a dead
