@@ -93,6 +93,37 @@ map $host $is_noindex {
     default 0;
 }
 
+# ------------------------------------------------------
+# Per-directory Basic auth
+# ------------------------------------------------------
+#
+# Tenants arrive carrying Apache habits, and a .htaccess declaring
+# `Require valid-user` reads as protection to everyone who looks at it. nginx
+# never reads .htaccess at all, so those directories are served wide open while
+# appearing guarded - chapaland's beta/ asked for Basic auth against an
+# AuthUserFile path that does not exist on this host, and additionally turned on
+# +Indexes. The only thing keeping it private was that the vhost was not
+# executing PHP.
+#
+# `nginx-pool auth` translates those declarations into the two maps below, so
+# the protection the tenant asked for is the protection they get. Entries are
+# emitted only when a readable .htpasswd exists, which keeps $auth_user_file
+# from ever naming a missing file while $auth_realm is active (that pairing is
+# a 500, not a prompt).
+#
+# Keyed on "$host$uri": $uri is normalised and carries no query string, so
+# ?x=/beta cannot be used to claim a protected prefix, nor /beta?x= to escape
+# one.
+map "$host$uri" $auth_realm {
+    include /etc/nginx/auth.map;
+    default off;               # "off" is nginx's own disable value
+}
+
+map $host $auth_user_file {
+    include /etc/nginx/auth_file.map;
+    default /etc/nginx/.htpasswd-none;
+}
+
 map "$is_pool_host:$host" $host_user {
     default "";
 
@@ -644,8 +675,27 @@ server {
     access_log /var/log/nginx/pool_access.log;
     error_log  /var/log/nginx/pool_error.log;
 
+    # Basic auth for directories a tenant marked private (see the auth maps
+    # above). $auth_realm is "off" for everything unprotected, so this is inert
+    # unless a rule matches.
+    #
+    # Declared at server level, NOT inside the dispatcher, and the difference
+    # matters: auth_basic is enforced in the ACCESS phase, while the dispatcher
+    # hands work to its named fallbacks with `return 59x` in the REWRITE phase,
+    # which runs first. A dispatcher-local auth_basic is therefore never
+    # reached - it silently authorises everything. At server level the named
+    # location the request is redirected into inherits it, and the access phase
+    # runs there, so the check actually happens.
+    auth_basic           $auth_realm;
+    auth_basic_user_file $auth_user_file;
+
     # ACME
     location ^~ /.well-known/acme-challenge/ {
+        # Never behind Basic auth: Let's Encrypt fetches this anonymously, and
+        # a tenant's .htaccess at a path that happened to cover it would stop
+        # certificates renewing. Server-level auth_basic is switched off here
+        # explicitly rather than relied upon not to match.
+        auth_basic off;
         root /var/www/letsencrypt;
     }
 
