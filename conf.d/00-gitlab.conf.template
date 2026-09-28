@@ -56,6 +56,6 @@ server {
 
     location / {
         add_header X-Robots-Tag "noindex, nofollow" always;
-        proxy_pass http://127.0.0.1:2443;
+        proxy_pass http://192.168.92.3:8080;
     }
 }
