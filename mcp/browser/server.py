@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -705,18 +706,37 @@ def handle(req):
             "error": {"code": -32601, "message": "unknown method " + str(method)}}
 
 
+def release_tabs():
+    """Close every tab this process opened. Nobody else will: the other servers
+    sharing the browser only ever reap their own, so a session that ended
+    without browser_close used to leave its page (and renderer) open for the
+    life of the browser."""
+    global TAB
+    if TAB is not None:
+        TAB.close()
+        TAB = None
+    reap_owned()
+
+
 def main():
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        out = handle(req)
-        if out is not None:
-            reply(out)
+    # The client ends a session by closing stdin or by SIGTERM/SIGHUP; turn the
+    # signals into a normal exit so the finally below runs either way.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(0))
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            out = handle(req)
+            if out is not None:
+                reply(out)
+    finally:
+        release_tabs()
 
 
 if __name__ == "__main__":
